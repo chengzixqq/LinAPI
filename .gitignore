@@ -2,7 +2,7 @@
 /bin/
 /dist/
 *.exe
-linapi
+/linapi
 
 # 本地配置（含密钥，勿提交）
 config.yaml
