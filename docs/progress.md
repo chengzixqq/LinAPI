@@ -4,11 +4,16 @@
 
 ## 当前协作状态（重要）
 
-> 2026-07-10 已完成三轮多智能体全面只读审查，累计确认 65 项（P0 7 / P1 34 / P2 24）。第三轮为安全专项，新增 14 项，覆盖免费额度套取、CSRF、认证滥用、SSE 慢读、SSRF、Redis/上游密钥保护、匿名资源耗尽和依赖公告。审查快照 `0736eb1` 已在 server 层注册 `/auth`、`/me`、`/admin`，但被 Git 忽略的 main 尚未注入账户/设置/会话依赖，标准二进制仍不会挂载这些路由；相关安全项因此继续标为条件性。完整证据、稳定问题 ID、修复批次和验收矩阵见 [`reviews/2026-07-10-comprehensive-readonly-audit.md`](reviews/2026-07-10-comprehensive-readonly-audit.md)。
+> 2026-07-10 已完成三轮多智能体全面只读审查，累计确认 65 项（P0 7 / P1 34 / P2 24）。第三轮为安全专项，新增 14 项，覆盖免费额度套取、CSRF、认证滥用、SSE 慢读、SSRF、Redis/上游密钥保护、匿名资源耗尽和依赖公告。完整证据、稳定问题 ID、修复批次和验收矩阵见 [`reviews/2026-07-10-comprehensive-readonly-audit.md`](reviews/2026-07-10-comprehensive-readonly-audit.md)。
 >
-> 当前状态：**只记录，暂不修复**。需等待 Claude 当前工作完成、合并并重新建立测试基线后，再由 AI 按 `AUD-*` ID 认领。审查发现不改变下方历史“已完成功能”的实现记录，但在 P0/P1 关闭前，不应把项目视为已满足真实商用计费上线条件。
+> **控制台安全批次已修复（2026-07-10，master 分支）**：先修控制台安全 + 即时止损，再做前端（Plan 2）——因为开前端需 `admin.enabled=true`，会点亮整个控制台攻击面。本轮已闭合：
+> - **批次 A（即时止损）**：AUD-P1-01（`/models` 误扣押金，拆分 /v1 中间件）、AUD-P1-03（余额不足 key 补 TTL）、AUD-P1-09（`.gitignore` 误伤 `cmd/linapi/`，已由 010b851 修）。
+> - **批次 G（控制台安全）**：AUD-P0-07（注册恒不送额度 + putSettings 拒绝正初始余额）、AUD-P1-26（CSRF 双重提交 token + 强制 JSON + Origin 校验）、AUD-P1-27（登录注册 IP 令牌桶限速 + bcrypt 并发信号量）、AUD-P1-28（自助 Key 每账户 ≤50 把、限速 ∈[1,5000]）、AUD-P1-29（可靠登出：删除失败回 503 不谎报）；P2-21 用户名枚举随 login/register 恒定工作量一并闭合。
+> - **批次 E（部分）**：AUD-P1-17（账户加 `session_version`，禁用/改密递增使旧会话立即失效；`SessionAuthWithVersion` 在 /auth、/me、/admin 三处接线）。
 >
-> Claude 已提交 server 会话路由，但端到端 main 装配尚未完成，且 `cmd/linapi/main.go` 仍受 `AUD-P1-09` 的忽略规则影响。main 完成装配后须优先复验审查文档第 17～21 节的条件性安全项。
+> main 端到端装配已完成（`cmd/linapi/main.go` 注入 Account/Settings/Session + `bootstrapAdmin` 播种首个管理员），标准二进制在 `admin.enabled=true` 下会挂载 `/auth`、`/me`、`/admin` 并受上述防护覆盖。全量 `go build`、`go vet`、`CGO_ENABLED=1 go test -race ./...` 全绿。
+>
+> **仍待处理**：批次 B（计费账本 AUD-P0-01～06 及相关 P1）需先做设计评审，本轮未动——在这些 P0/P1 关闭前，不应把项目视为已满足真实商用计费上线条件。批次 C/D/F/H 及其余 P2 亦待后续认领。逐项状态见审查文档第 10 节跟踪表。
 
 ## 七步计划
 
@@ -135,11 +140,23 @@
 - **附带修复**：`.gitignore` 裸 `linapi` 规则改 `/linapi` 锚定仓库根——原规则误伤 `cmd/linapi/` 源码目录，导致入口 `main.go` 长期未被 Git 跟踪（对应审查文档 `AUD-P1-09`）。
 - 测试覆盖：account（密码哈希、内存/PG 双实现 CRUD、建 user 连带计费实体、角色校验）、session（会话往返/TTL/删除）、server（/auth、/me 越权硬约束、/admin 账户/设置 HTTP 全链路、密码哈希不外泄、角色分流）、middleware（SessionAuth/RequireRole fail-closed）；全过 `-race`。
 
+### 第 12 步 · 控制台安全加固（审查批次 A/G + P1-17）
+在开前端（Plan 2）前先闭合控制台攻击面——开前端需 `admin.enabled=true`，会点亮 `/auth` `/me` `/admin` 全部端点。按 codex 审查（`docs/reviews/2026-07-10-*.md`）逐项 TDD 修复：
+- **AUD-P1-01 · `/models` 误扣押金**：拆分 `/v1` 中间件分组——`Auth` + `RateLimit` 作公共前置，`Quota`（预扣押金）只挂真正产生上游用量的生成端点（`/chat/completions`、`/messages`）。`/models` 只读元数据端点不再每查一次就永久扣掉一笔 `default_reserve`。
+- **AUD-P1-03 · 余额不足 key 无 TTL**：Redis 计费 `adjustScript` seed 时即带 `EX ttl`。原实现余额不足会在 `EXPIRE` 前提前 return，留下永久 key，使后续冷源充值被陈旧热副本永久屏蔽。
+- **AUD-P0-07 · 注册无限复制赠送额度**：自助注册恒绑定初始余额 0（忽略 `settings.NewUserInitialBalance`）；`putSettings` 拒绝把 `NewUserInitialBalance` 设为正数，双重堵死路径。发放额度只能走管理面主动建号 / 充值（可信操作）。
+- **AUD-P1-26 · CSRF 防护**：`middleware.CSRFProtect` 对 Cookie 鉴权的写请求做①双重提交 token（会话绑定的 `CSRFToken` vs 请求头 `X-CSRF-Token`）②强制 `Content-Type: application/json`③Origin/Referer 校验。登录下发非 HttpOnly 的 CSRF Cookie 供前端读取回传；`/me` `/admin` 写端点全挂，GET 自动放行。
+- **AUD-P1-27 · 登录注册滥用限速**：`/auth/login` `/auth/register` 在 bcrypt 之前按来源 IP 令牌桶限流（`IPRateLimiter`）+ 全局 bcrypt 并发信号量（容量 = CPU 核数），排不上队回 503，堵住撞库与 CPU 耗尽。
+- **AUD-P1-28 · 自助 Key 无上限**：自助建 key 强制 `rate_limit_per_min ∈ [1,5000]`（杜绝 0/负数=不限流与超大值绕过限流）、每账户 ≤50 把。管理面建 key 面向运维不受此限。
+- **AUD-P1-29 · 登出假成功**：logout 用独立 3s 超时 context 删会话（不复用请求 context，避免客户端断开取消删除），删除失败回 503 且不清 Cookie，绝不让用户误以为已安全登出而服务端 token 仍有效。
+- **AUD-P1-17 · 会话撤销**：`accounts` 表加 `session_version`（schema 双写），禁用 / 改密时在数据层递增。登录把当前代次快照进会话，`SessionAuthWithVersion` 鉴权时回查账户当前代次比对：不一致即判定为陈旧会话，主动删除并 401；回查出错 fail-closed 回 503。在 `/auth`（logout/me）、`/me`、`/admin` 三处接线。使被盗 token、被禁用户 / 被禁管理员的旧 Cookie 立即失效。
+- 全量 `go build` / `go vet` / `CGO_ENABLED=1 go test -race ./...` 全绿。逐项证据见审查文档第 10 节跟踪表。
+
 ## 测试现状
 
-- 142 个测试函数，分布在 35 个文件。
+- 172 个测试函数，分布在 38 个文件。
 - 全部通过，且 `CGO_ENABLED=1 go test -race ./...` 干净（gcc 已装好，路径见 CLAUDE.md）。
-- billing / account / session 用 `miniredis`（内嵌 Lua）真实执行原子脚本；PGStore / PGSink / account.PGStore 用 fake Querier 单测（不依赖真实 PG）；转发层用 `httptest` 起模拟上游 + `miniredis`，走鉴权→额度→转发全链路集成测试（含流式与同格式直通保真）；管理面与控制台（admin/account/server）用内存 Store + `httptest` 走 HTTP 全链路；访问日志中间件用 `bytes.Buffer` 捕获 JSON 日志断言字段。
+- billing / account / session 用 `miniredis`（内嵌 Lua）真实执行原子脚本；PGStore / PGSink / account.PGStore 用 fake Querier 单测（不依赖真实 PG）；转发层用 `httptest` 起模拟上游 + `miniredis`，走鉴权→额度→转发全链路集成测试（含流式与同格式直通保真）；管理面与控制台（admin/account/server）用内存 Store + `httptest` 走 HTTP 全链路；访问日志中间件用 `bytes.Buffer` 捕获 JSON 日志断言字段。控制台安全（第 12 步）：CSRF 双重提交 / IP 限速 / bcrypt 信号量 / 会话代次撤销均有针对性测试，会话失效走「登录→禁用或改密→旧 Cookie 再访问应 401」端到端断言。
 
 ## 端到端现状
 
@@ -150,6 +167,6 @@
 当前实现已可用且具备基本运维能力（管理面 / 指标 / 热重载 / 直通优化已落地）。以下为仍可继续的增强：
 - **链路追踪**：结构化访问日志（`RequestLogger`，request_id 贯通）+ Prometheus 指标已铺开，但尚无分布式追踪（OpenTelemetry span 传播）。
 - **控制台前端**：本轮完成的是控制台**后端**（`/auth` `/me` `/admin`）；登录页 / 管理控制台 UI / 用户面板属另一份前端计划（Plan 2），尚未实现。
-- **认证体系可继续增强**：账户认证（账号密码 + 会话 + admin/user 角色）已落地；仍可扩展的有——审计日志、更细粒度 RBAC（当前仅 admin/user 两级）、`rate_multiplier` / `group_name` 预留字段的实际启用、CSRF 防护与匿名注册限流（见审查文档条件性安全项）。
+- **认证体系可继续增强**：账户认证（账号密码 + 会话 + admin/user 角色）+ 控制台安全加固（CSRF、登录注册限速、自助 Key 上限、会话代次撤销、注册不送额度）已落地（见第 12 步）；仍可扩展的有——审计日志、更细粒度 RBAC（当前仅 admin/user 两级）、`rate_multiplier` / `group_name` 预留字段的实际启用、每账户活跃会话数上限。
 - **更多供应商适配器**：当前 openai / anthropic 两家；Gemini 等可按注册机制扩展。
 - **sqlc 为手写同构产物**：`internal/db/` 是按 sqlc 约定手写的等价代码（环境无法联网装 sqlc）；能装 sqlc 后 `sqlc generate` 可原样覆盖。改表结构时记得同步根 `db/schema.sql` 与 `internal/db/schema.sql` 两份。

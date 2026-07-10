@@ -38,6 +38,9 @@ type Account struct {
 	GroupName  string    `json:"group_name"`
 	Enabled    bool      `json:"enabled"`
 	CreatedAt  time.Time `json:"created_at"`
+	// SessionVersion 是会话代次（审查 AUD-P1-17）：登录时快照进会话 token，鉴权时比对。
+	// 禁用账户、重置密码时递增，使一切旧会话立即失效（被盗 token、被禁管理员的旧 Cookie）。
+	SessionVersion int `json:"session_version"`
 }
 
 // Credentials 是登录校验用的内部结构：账户视图 + 密码哈希。

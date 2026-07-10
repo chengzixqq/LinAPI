@@ -91,6 +91,9 @@ type AdminConfig struct {
 	Bootstrap BootstrapConfig `mapstructure:"bootstrap"`
 	// ChannelReloadInterval 是渠道定时热重载的间隔（秒）。<=0 关闭。仅 database.enabled=true 生效。
 	ChannelReloadInterval int `mapstructure:"channel_reload_interval"`
+	// AuthRateLimitPerMin 是匿名认证端点（/auth/login、/auth/register）每来源 IP 每分钟的
+	// 请求上限，在 bcrypt 之前拦截，堵住在线撞库与 CPU 耗尽（审查 AUD-P1-27）。<=0 关闭限流。
+	AuthRateLimitPerMin int `mapstructure:"auth_rate_limit_per_min"`
 }
 
 // BootstrapConfig 描述首个管理员账户的播种参数。
@@ -172,6 +175,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("admin.bootstrap.username", "")
 	v.SetDefault("admin.bootstrap.password", "")
 	v.SetDefault("admin.channel_reload_interval", 60)
+	// 匿名认证端点每 IP 每分钟上限，bcrypt 前拦截撞库（审查 AUD-P1-27）。默认 30 次/分钟：
+	// 正常用户登录绰绰有余，暴力破解则被卡死。<=0 关闭。
+	v.SetDefault("admin.auth_rate_limit_per_min", 30)
 
 	// 计费默认值：默认预扣额与兜底单价。单价 = 最小计费单位 / 每 100 万 token。
 	// 这里给出保守的非零兜底，避免误配为 0 导致「免费」漏洞。

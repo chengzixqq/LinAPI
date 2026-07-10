@@ -122,6 +122,33 @@ func TestAccountSettleAllowsNegative(t *testing.T) {
 	}
 }
 
+// TestAccountReserveInsufficientKeepsTTL 验证首次预扣即余额不足时，seed 写入的
+// 余额 key 仍带正 TTL——否则该 key 永不过期，后续冷源充值会被这枚陈旧热副本永久屏蔽
+// （审查 AUD-P1-03）。
+func TestAccountReserveInsufficientKeepsTTL(t *testing.T) {
+	ctx := context.Background()
+	rdb := newTestRedis(t)
+	acc := NewAccount(rdb)
+
+	// 首次预扣即不足：seed=100，扣 150 应失败，但 key 已被 seed 写入。
+	ok, _, err := acc.Reserve(ctx, "u1", 150, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("余额不足时预扣应失败")
+	}
+
+	// 关键断言：seed 出的 key 必须带正 TTL，不能是永久 key（-1）。
+	ttl, err := rdb.TTL(ctx, balanceKeyPrefix+"u1").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl <= 0 {
+		t.Fatalf("余额不足后 key 应带正 TTL，得 %v（-1=永久 key，会永久屏蔽后续充值）", ttl)
+	}
+}
+
 // TestAccountConcurrentReserveNoOversell 验证高并发下 Redis 原子扣费不超卖：
 // 100 个 goroutine 各抢扣 10，总额恰好 1000，应正好全部成功且余额归零，
 // 多扣（余额变负）或少扣都是 bug。

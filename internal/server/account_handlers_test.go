@@ -83,10 +83,27 @@ func TestAdminAccountResponseHasNoPasswordHash(t *testing.T) {
 	}
 }
 
+// TestPutSettingsRejectsPositiveInitialBalance 是 P0-07 的纵深防御：既然自助注册
+// 恒不发额度（register 固定传 0），new_user_initial_balance 已无正向语义。管理员
+// 若把它设成正值，只会得到一个“看起来会发额度、实则被忽略”的脏配置（脚枪）——
+// 直接在写入层拒绝正值，杜绝误配复活“注册送额度”的错觉。
+func TestPutSettingsRejectsPositiveInitialBalance(t *testing.T) {
+	e, _ := newAccountConsoleEngine(t)
+	body, _ := json.Marshal(gin.H{"registration_enabled": true, "new_user_initial_balance": 1})
+	req := httptest.NewRequest(http.MethodPut, "/admin/settings", bytesReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("正的 new_user_initial_balance 应 400, 得到 %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestAdminSettingsRoundTrip(t *testing.T) {
 	e, _ := newAccountConsoleEngine(t)
-	// 改设置。
-	body, _ := json.Marshal(gin.H{"registration_enabled": true, "new_user_initial_balance": 5000})
+	// 改设置。new_user_initial_balance 恒为 0（P0-07 后正值会被拒），此处验证
+	// registration_enabled 开关与 0 额度能正常往返持久化。
+	body, _ := json.Marshal(gin.H{"registration_enabled": true, "new_user_initial_balance": 0})
 	req := httptest.NewRequest(http.MethodPut, "/admin/settings", bytesReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -100,7 +117,7 @@ func TestAdminSettingsRoundTrip(t *testing.T) {
 	e.ServeHTTP(w, req)
 	var got account.Settings
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
-	if !got.RegistrationEnabled || got.NewUserInitialBalance != 5000 {
+	if !got.RegistrationEnabled || got.NewUserInitialBalance != 0 {
 		t.Fatalf("设置未持久化: %+v", got)
 	}
 }

@@ -95,11 +95,17 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- group_name 预留：定价分组名，本期存而不用。
     group_name    TEXT        NOT NULL DEFAULT 'default',
     enabled       BOOLEAN     NOT NULL DEFAULT TRUE,
+    -- session_version 会话代次（审查 AUD-P1-17）：禁用/改密时递增，使旧会话立即失效。
+    session_version INT       NOT NULL DEFAULT 0,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_role ON accounts (role);
+
+-- 兼容既有部署：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，故显式幂等补列
+-- （审查 AUD-P1-17，session_version 为后加字段）。ADD COLUMN IF NOT EXISTS 需 PG 9.6+。
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS session_version INT NOT NULL DEFAULT 0;
 
 -- 系统设置：运行时可变的 KV 配置，控制台可改、即时生效。
 CREATE TABLE IF NOT EXISTS settings (

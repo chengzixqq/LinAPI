@@ -169,13 +169,14 @@ func (s *PGStore) Put(ctx context.Context, st Settings) error {
 // accountFromDB 把 db.Account 转为领域视图（丢弃 password_hash）。
 func accountFromDB(a db.Account) Account {
 	return Account{
-		ID:         a.ID,
-		Username:   a.Username,
-		Role:       a.Role,
-		ExternalID: a.ExternalID.String,
-		GroupName:  a.GroupName,
-		Enabled:    a.Enabled,
-		CreatedAt:  a.CreatedAt.Time,
+		ID:             a.ID,
+		Username:       a.Username,
+		Role:           a.Role,
+		ExternalID:     a.ExternalID.String,
+		GroupName:      a.GroupName,
+		Enabled:        a.Enabled,
+		SessionVersion: int(a.SessionVersion),
+		CreatedAt:      a.CreatedAt.Time,
 	}
 }
 

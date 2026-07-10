@@ -11,6 +11,18 @@ import (
 	"linapi/internal/store"
 )
 
+// 自助建 key 的服务端硬约束（审查 AUD-P1-28）：
+//   - rate_limit_per_min 必须落在 [minSelfKeyRateLimit, maxSelfKeyRateLimit]。
+//     0/负数会被限流层解释为“不限流”，超大值可绕过平台限流，一律在建 key 前拒绝。
+//   - 每账户 key 数量不得超过 maxSelfKeysPerAccount，防止批量建 key 线性叠加配额、
+//     撑爆存储与 O(n) 归属检查。
+// 管理面（/admin）的建 key 不受此限——面向运维，可为渠道/系统账户放宽。
+const (
+	minSelfKeyRateLimit   = 1
+	maxSelfKeyRateLimit   = 5000
+	maxSelfKeysPerAccount = 50
+)
+
 // meHandlers 聚合 /me 用户自助端点。绑定用户一律取自会话，杜绝越权。
 type meHandlers struct {
 	svc   *admin.Service
@@ -99,6 +111,23 @@ func (h *meHandlers) createKey(c *gin.Context) {
 	var req meCreateKeyReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
+		return
+	}
+	// 服务端强制 rate_limit 上下限：杜绝 0/负数（=不限流）与超大值（绕过平台限流）。
+	if req.RateLimitPerMin < minSelfKeyRateLimit || req.RateLimitPerMin > maxSelfKeyRateLimit {
+		writeError(c, http.StatusBadRequest, "invalid_request_error",
+			"rate_limit_per_min 必须在 1 到 5000 之间")
+		return
+	}
+	// 每账户 key 数量硬上限：防止批量建 key 线性叠加配额、撑爆存储。
+	existing, err := h.svc.Store().ListAPIKeysByUser(c.Request.Context(), ext)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "internal_error", "读取密钥失败")
+		return
+	}
+	if len(existing) >= maxSelfKeysPerAccount {
+		writeError(c, http.StatusConflict, "conflict",
+			"已达每账户密钥数量上限（50），请删除不用的密钥后重试")
 		return
 	}
 	gen, err := admin.GenerateKey()

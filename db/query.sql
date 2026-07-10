@@ -147,20 +147,20 @@ WHERE channel_id = $1;
 -- name: CreateAccount :one
 INSERT INTO accounts (username, password_hash, role, external_id)
 VALUES ($1, $2, $3, $4)
-RETURNING id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at;
+RETURNING id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at;
 
 -- name: GetAccountByUsername :one
 -- 按登录名取账户（登录校验用）。
-SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+SELECT id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at
 FROM accounts WHERE username = $1;
 
 -- name: GetAccountByID :one
-SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+SELECT id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at
 FROM accounts WHERE id = $1;
 
 -- name: ListAccounts :many
 -- 管理面：分页列出账户。
-SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+SELECT id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at
 FROM accounts ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2;
 
 -- name: CountAccounts :one
@@ -168,14 +168,20 @@ FROM accounts ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2;
 SELECT count(*) FROM accounts;
 
 -- name: SetAccountEnabled :one
--- 启停账户。
-UPDATE accounts SET enabled = $2, updated_at = now()
+-- 启停账户；禁用时递增 session_version 使旧会话立即失效（审查 AUD-P1-17）。
+-- 重新启用（$2=TRUE）不递增——无需踢已在线会话。
+UPDATE accounts
+SET enabled = $2,
+    session_version = session_version + CASE WHEN $2 = FALSE THEN 1 ELSE 0 END,
+    updated_at = now()
 WHERE id = $1
-RETURNING id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at;
+RETURNING id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at;
 
 -- name: UpdateAccountPassword :exec
--- 改密（存新的 bcrypt 哈希）。
-UPDATE accounts SET password_hash = $2, updated_at = now() WHERE id = $1;
+-- 改密（存新的 bcrypt 哈希）并递增 session_version，使旧会话立即失效（审查 AUD-P1-17）。
+UPDATE accounts
+SET password_hash = $2, session_version = session_version + 1, updated_at = now()
+WHERE id = $1;
 
 -- ============================ settings ============================
 

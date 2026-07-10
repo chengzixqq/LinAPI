@@ -91,6 +91,60 @@ func TestMeCannotTouchOthersKey(t *testing.T) {
 	}
 }
 
+// TestMeCreateKeyRejectsInvalidRateLimit 验证自助建 key 时服务端强制 rate_limit 上下限：
+// 0/负数会被限流层解释为“不限流”，超大值可绕过平台限流，都必须在建 key 前拒绝
+// （审查 AUD-P1-28）。
+func TestMeCreateKeyRejectsInvalidRateLimit(t *testing.T) {
+	for _, rl := range []int{0, -1, maxSelfKeyRateLimit + 1} {
+		e, _ := newMeTestEngine(t, "me")
+		body, _ := json.Marshal(gin.H{"rate_limit_per_min": rl})
+		req := httptest.NewRequest(http.MethodPost, "/me/keys", bytesReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		e.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("rate_limit=%d 应 400, 得到 %d; body=%s", rl, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestMeCreateKeyEnforcesPerAccountCap 验证每账户 Key 数量硬上限：达到上限后再建应 409，
+// 防止普通用户批量建 key 线性叠加配额、撑爆存储与 O(n) 归属检查（审查 AUD-P1-28）。
+func TestMeCreateKeyEnforcesPerAccountCap(t *testing.T) {
+	e, svc := newMeTestEngine(t, "me")
+	// 直接预置到上限，避免逐个 HTTP 建。
+	for i := 0; i < maxSelfKeysPerAccount; i++ {
+		gen, _ := admin.GenerateKey()
+		if _, err := svc.Store().CreateAPIKey(context.Background(), admin.CreateAPIKeyInput{
+			APIKey: gen.APIKey, KeyID: gen.KeyID, UserID: "me", RateLimitPerMin: 60, Enabled: true,
+		}); err != nil {
+			t.Fatalf("预置第 %d 把 key 失败: %v", i, err)
+		}
+	}
+
+	body, _ := json.Marshal(gin.H{"rate_limit_per_min": 60})
+	req := httptest.NewRequest(http.MethodPost, "/me/keys", bytesReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("超过每账户 Key 上限应 409, 得到 %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestMeCreateKeyWithinLimitsSucceeds 验证合法 rate_limit 且未达上限时仍能正常建 key。
+func TestMeCreateKeyWithinLimitsSucceeds(t *testing.T) {
+	e, _ := newMeTestEngine(t, "me")
+	body, _ := json.Marshal(gin.H{"rate_limit_per_min": 60})
+	req := httptest.NewRequest(http.MethodPost, "/me/keys", bytesReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("合法建 key 应 201, 得到 %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestMeProfileReturnsBalance(t *testing.T) {
 	e, svc := newMeTestEngine(t, "me")
 	_, _ = svc.Store().AddBalance(context.Background(), "me", 888)

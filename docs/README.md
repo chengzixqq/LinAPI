@@ -7,8 +7,11 @@
 1. [architecture.md](architecture.md) —— 整体架构、请求生命周期、三大核心抽象的边界与协作
 2. [modules.md](modules.md) —— 各模块（canonical / adapter / routing / server / config）逐一详解
 3. [progress.md](progress.md) —— 开发进度、已完成模块清单、待办与下一步计划
+4. [reviews/2026-07-10-comprehensive-readonly-audit.md](reviews/2026-07-10-comprehensive-readonly-audit.md) —— 三轮多智能体全面只读审查；累计记录 65 项已确认 BUG/安全风险、证据、修复批次与 AI 交接要求
 
 根目录的 [CLAUDE.md](../CLAUDE.md) 是给 Claude Code 的速查版（命令 + 架构要点），本目录是展开版。
+
+> **协作提示（2026-07-10）**：全面审查问题已经记录，但为避免与 Claude 当前进行中的工作冲突，暂不实施修复。Claude 完成并建立新基线后，再按审查文档的稳定问题 ID 分批认领。
 
 ## 一句话概览
 

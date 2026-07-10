@@ -42,7 +42,9 @@ local floor = tonumber(ARGV[3])
 local ttl = tonumber(ARGV[4])
 
 if redis.call('EXISTS', key) == 0 then
-  redis.call('SET', key, seed)
+  -- seed 时即带 TTL：余额不足会在 EXPIRE 之前提前 return，若此处不带 TTL 则留下
+  -- 永久 key，后续冷源充值被陈旧热副本永久屏蔽（审查 AUD-P1-03）。
+  redis.call('SET', key, seed, 'EX', ttl)
 end
 
 local bal = tonumber(redis.call('GET', key))

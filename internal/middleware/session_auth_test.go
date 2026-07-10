@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -142,5 +143,93 @@ func TestRequireRoleWithoutSession(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("无会话应 401, 得到 %d", w.Code)
+	}
+}
+
+// TestSessionAuthWithVersionAcceptsMatch 验证带会话代次校验时，会话快照 version 与账户
+// 当前 version 一致则放行（审查 AUD-P1-17）。
+func TestSessionAuthWithVersionAcceptsMatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newSessionManager(t)
+	token, _ := m.Create(context.Background(), session.SessionData{
+		AccountID: 7, Username: "alice", Role: "user", SessionVersion: 3,
+	}, session.DefaultTTL)
+
+	// 账户当前 version=3，与会话快照一致。
+	checker := SessionVersionCheckerFunc(func(_ context.Context, id int64) (int, error) {
+		if id != 7 {
+			t.Fatalf("应按会话 AccountID=7 回查, 得到 %d", id)
+		}
+		return 3, nil
+	})
+
+	r := gin.New()
+	r.Use(SessionAuthWithVersion(m, checker))
+	r.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.AddCookie(&http.Cookie{Name: CookieName, Value: token})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("代次一致应 200, 得到 %d", w.Code)
+	}
+}
+
+// TestSessionAuthWithVersionRejectsStale 验证账户 version 已递增（禁用/改密）后，
+// 持旧代次快照的会话被拒 401，且该会话被主动删除，杜绝旧 Cookie 继续可用
+// （审查 AUD-P1-17）。
+func TestSessionAuthWithVersionRejectsStale(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newSessionManager(t)
+	token, _ := m.Create(context.Background(), session.SessionData{
+		AccountID: 7, Username: "alice", Role: "user", SessionVersion: 3,
+	}, session.DefaultTTL)
+
+	// 账户当前 version=4（已因禁用/改密递增），旧会话快照 3 应作废。
+	checker := SessionVersionCheckerFunc(func(_ context.Context, _ int64) (int, error) {
+		return 4, nil
+	})
+
+	r := gin.New()
+	r.Use(SessionAuthWithVersion(m, checker))
+	r.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.AddCookie(&http.Cookie{Name: CookieName, Value: token})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("代次过期应 401, 得到 %d", w.Code)
+	}
+	// 过期会话应被主动删除（下次拿同 token 反查已不存在）。
+	if _, err := m.Get(context.Background(), token); err == nil {
+		t.Fatal("代次过期的会话应被主动删除")
+	}
+}
+
+// TestSessionAuthWithVersionFailsClosedOnCheckerError 验证代次回查出错（账户库异常）时
+// fail-closed 返回 503，而非放行——绝不能因回查失败就跳过代次校验（审查 AUD-P1-17）。
+func TestSessionAuthWithVersionFailsClosedOnCheckerError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := newSessionManager(t)
+	token, _ := m.Create(context.Background(), session.SessionData{
+		AccountID: 7, Username: "alice", Role: "user", SessionVersion: 3,
+	}, session.DefaultTTL)
+
+	checker := SessionVersionCheckerFunc(func(_ context.Context, _ int64) (int, error) {
+		return 0, errors.New("账户库暂时不可用")
+	})
+
+	r := gin.New()
+	r.Use(SessionAuthWithVersion(m, checker))
+	r.GET("/probe", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.AddCookie(&http.Cookie{Name: CookieName, Value: token})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("代次回查出错应 fail-closed 503, 得到 %d", w.Code)
 	}
 }

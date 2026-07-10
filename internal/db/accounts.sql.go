@@ -9,7 +9,7 @@ import (
 const createAccount = `-- name: CreateAccount :one
 INSERT INTO accounts (username, password_hash, role, external_id)
 VALUES ($1, $2, $3, $4)
-RETURNING id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+RETURNING id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at
 `
 
 // CreateAccountParams 是 CreateAccount 的入参。
@@ -24,12 +24,12 @@ type CreateAccountParams struct {
 func (q *Queries) CreateAccount(ctx context.Context, arg CreateAccountParams) (Account, error) {
 	row := q.db.QueryRow(ctx, createAccount, arg.Username, arg.PasswordHash, arg.Role, arg.ExternalID)
 	var i Account
-	err := row.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.CreatedAt, &i.UpdatedAt)
+	err := row.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.SessionVersion, &i.CreatedAt, &i.UpdatedAt)
 	return i, err
 }
 
 const getAccountByUsername = `-- name: GetAccountByUsername :one
-SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+SELECT id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at
 FROM accounts WHERE username = $1
 `
 
@@ -37,12 +37,12 @@ FROM accounts WHERE username = $1
 func (q *Queries) GetAccountByUsername(ctx context.Context, username string) (Account, error) {
 	row := q.db.QueryRow(ctx, getAccountByUsername, username)
 	var i Account
-	err := row.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.CreatedAt, &i.UpdatedAt)
+	err := row.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.SessionVersion, &i.CreatedAt, &i.UpdatedAt)
 	return i, err
 }
 
 const getAccountByID = `-- name: GetAccountByID :one
-SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+SELECT id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at
 FROM accounts WHERE id = $1
 `
 
@@ -50,12 +50,12 @@ FROM accounts WHERE id = $1
 func (q *Queries) GetAccountByID(ctx context.Context, id int64) (Account, error) {
 	row := q.db.QueryRow(ctx, getAccountByID, id)
 	var i Account
-	err := row.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.CreatedAt, &i.UpdatedAt)
+	err := row.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.SessionVersion, &i.CreatedAt, &i.UpdatedAt)
 	return i, err
 }
 
 const listAccounts = `-- name: ListAccounts :many
-SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+SELECT id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at
 FROM accounts ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2
 `
 
@@ -75,7 +75,7 @@ func (q *Queries) ListAccounts(ctx context.Context, arg ListAccountsParams) ([]A
 	items := []Account{}
 	for rows.Next() {
 		var i Account
-		if err := rows.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.CreatedAt, &i.UpdatedAt); err != nil {
+		if err := rows.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.SessionVersion, &i.CreatedAt, &i.UpdatedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -95,10 +95,15 @@ func (q *Queries) CountAccounts(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// SetAccountEnabled 启停账户；禁用时递增 session_version 使旧会话立即失效
+// （审查 AUD-P1-17）。重新启用（$2=TRUE）不递增——无需踢已在线会话。
 const setAccountEnabled = `-- name: SetAccountEnabled :one
-UPDATE accounts SET enabled = $2, updated_at = now()
+UPDATE accounts
+SET enabled = $2,
+    session_version = session_version + CASE WHEN $2 = FALSE THEN 1 ELSE 0 END,
+    updated_at = now()
 WHERE id = $1
-RETURNING id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+RETURNING id, username, password_hash, role, external_id, group_name, enabled, session_version, created_at, updated_at
 `
 
 // SetAccountEnabledParams 是 SetAccountEnabled 的入参。
@@ -111,12 +116,16 @@ type SetAccountEnabledParams struct {
 func (q *Queries) SetAccountEnabled(ctx context.Context, arg SetAccountEnabledParams) (Account, error) {
 	row := q.db.QueryRow(ctx, setAccountEnabled, arg.ID, arg.Enabled)
 	var i Account
-	err := row.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.CreatedAt, &i.UpdatedAt)
+	err := row.Scan(&i.ID, &i.Username, &i.PasswordHash, &i.Role, &i.ExternalID, &i.GroupName, &i.Enabled, &i.SessionVersion, &i.CreatedAt, &i.UpdatedAt)
 	return i, err
 }
 
+// UpdateAccountPassword 改密并递增 session_version，使旧会话（含密码泄露期间建立的）
+// 立即失效（审查 AUD-P1-17）。
 const updateAccountPassword = `-- name: UpdateAccountPassword :exec
-UPDATE accounts SET password_hash = $2, updated_at = now() WHERE id = $1
+UPDATE accounts
+SET password_hash = $2, session_version = session_version + 1, updated_at = now()
+WHERE id = $1
 `
 
 // UpdateAccountPasswordParams 是 UpdateAccountPassword 的入参。

@@ -141,6 +141,10 @@ func (m *MemoryStore) SetEnabled(_ context.Context, id int64, enabled bool) (Acc
 		return Account{}, ErrNotFound
 	}
 	rec.acc.Enabled = enabled
+	// 禁用递增会话代次，使旧会话立即失效（审查 AUD-P1-17）；重新启用无需踢已在线会话。
+	if !enabled {
+		rec.acc.SessionVersion++
+	}
 	return rec.acc, nil
 }
 
@@ -152,6 +156,8 @@ func (m *MemoryStore) UpdatePassword(_ context.Context, id int64, passwordHash s
 		return ErrNotFound
 	}
 	rec.hash = passwordHash
+	// 改密递增会话代次，使旧会话（含密码泄露期间建立的）立即失效（审查 AUD-P1-17）。
+	rec.acc.SessionVersion++
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"time"
 
 	"linapi/internal/account"
@@ -89,17 +90,25 @@ func (s *Server) registerRoutes() {
 
 	rateLimiter := middleware.NewRateLimiter(s.deps.Redis)
 
-	// v1 兼容端点分组：鉴权 -> 限流 -> 额度闸门
+	// v1 兼容端点分组。
+	//
+	// 中间件分层：Auth + RateLimit 是所有 /v1 端点的公共前置；Quota（预扣押金）
+	// 只加在真正产生上游用量的生成端点上。/models 是只读元数据端点，不发上游、
+	// 无用量，若也过 Quota 会每查一次就永久扣掉一笔 default_reserve 不退
+	// （审查 AUD-P1-01）——故它只经 Auth+RateLimit，绝不预扣。
 	v1 := s.engine.Group("/v1")
 	v1.Use(
 		middleware.Auth(s.deps.Store),
 		rateLimiter.Middleware(),
-		middleware.Quota(s.deps.Store, s.deps.Billing),
 	)
 	{
-		v1.POST("/chat/completions", s.deps.Forwarder.Handler("openai")) // OpenAI 兼容
-		v1.POST("/messages", s.deps.Forwarder.Handler("anthropic"))      // Claude 兼容
 		v1.GET("/models", s.listModels)
+
+		// 生成端点子组：额外叠加 Quota 预扣闸门。
+		gen := v1.Group("")
+		gen.Use(middleware.Quota(s.deps.Store, s.deps.Billing))
+		gen.POST("/chat/completions", s.deps.Forwarder.Handler("openai")) // OpenAI 兼容
+		gen.POST("/messages", s.deps.Forwarder.Handler("anthropic"))      // Claude 兼容
 	}
 
 	s.registerAuthRoutes()
@@ -113,12 +122,21 @@ func (s *Server) registerAuthRoutes() {
 	if !s.cfg.Admin.Enabled || s.deps.Account == nil || s.deps.Settings == nil || s.deps.Session == nil {
 		return
 	}
-	h := newAuthHandlers(s.deps.Account, s.deps.Settings, s.deps.Session, s.deps.SecureCookie)
+	// bcrypt 并发信号量（审查 AUD-P1-27）：容量取 CPU 核数——bcrypt 是 CPU 密集，
+	// 并发度约等于核数最优，多余请求排队而非无界堆积 goroutine 打满 CPU。
+	bcryptSem := middleware.NewSemaphore(runtime.NumCPU())
+	h := newAuthHandlers(s.deps.Account, s.deps.Settings, s.deps.Session, s.deps.SecureCookie, bcryptSem)
+
 	g := s.engine.Group("/auth")
-	g.POST("/register", h.register)
-	g.POST("/login", h.login)
-	g.POST("/logout", middleware.SessionAuth(s.deps.Session), h.logout)
-	g.GET("/me", middleware.SessionAuth(s.deps.Session), h.me)
+	// 登录/注册是匿名端点，在 bcrypt 之前按来源 IP 限流，堵住撞库与 CPU 耗尽。
+	// logout/me 已由 SessionAuth 天然限制（需有效会话），无需再叠 IP 限流。
+	authLimiter := middleware.NewIPRateLimiter(s.deps.Redis, "auth", s.cfg.Admin.AuthRateLimitPerMin)
+	// 会话代次校验（审查 AUD-P1-17）：logout/me 用带代次的鉴权，账户禁用/改密后旧会话立即失效。
+	sessAuth := middleware.SessionAuthWithVersion(s.deps.Session, s.sessionVersionChecker())
+	g.POST("/register", authLimiter.Middleware(), h.register)
+	g.POST("/login", authLimiter.Middleware(), h.login)
+	g.POST("/logout", sessAuth, h.logout)
+	g.GET("/me", sessAuth, h.me)
 }
 
 // registerMeRoutes 挂载 /me 分组（用户自助）。需登录（任意角色）。
@@ -129,7 +147,10 @@ func (s *Server) registerMeRoutes() {
 		return
 	}
 	h := newMeHandlers(s.deps.Admin, s.deps.Store)
-	g := s.engine.Group("/me", middleware.SessionAuth(s.deps.Session))
+	// SessionAuth 注入会话后叠 CSRFProtect：/me 的写操作（建/删/启停 key）经 Cookie 鉴权，
+	// 须过 CSRF 校验（审查 AUD-P1-26）；GET 由中间件自动放行。
+	// 鉴权用带会话代次校验的形式（审查 AUD-P1-17）：账户禁用/改密后旧会话立即失效。
+	g := s.engine.Group("/me", middleware.SessionAuthWithVersion(s.deps.Session, s.sessionVersionChecker()), middleware.CSRFProtect())
 	g.GET("/profile", h.profile)
 	g.GET("/keys", h.listKeys)
 	g.POST("/keys", h.createKey)
@@ -148,8 +169,10 @@ func (s *Server) registerAdminRoutes() {
 
 	h := &adminHandlers{svc: s.deps.Admin}
 	ac := newAccountConsoleHandlers(s.deps.Account, s.deps.Settings)
-	// 管理面改「会话 + admin 角色」鉴权（替换裸 token）。
-	g := s.engine.Group("/admin", middleware.SessionAuth(s.deps.Session), middleware.RequireRole(account.RoleAdmin))
+	// 管理面改「会话 + admin 角色」鉴权（替换裸 token），再叠 CSRFProtect 守护写操作
+	// （审查 AUD-P1-26）：账户/设置/渠道等一切写端点均经 Cookie 鉴权，须过 CSRF 校验。
+	// 会话鉴权用带代次校验的形式（审查 AUD-P1-17）：账户禁用/改密后旧会话（含被禁管理员的）立即失效。
+	g := s.engine.Group("/admin", middleware.SessionAuthWithVersion(s.deps.Session, s.sessionVersionChecker()), middleware.RequireRole(account.RoleAdmin), middleware.CSRFProtect())
 	{
 		// 账户与系统设置
 		g.GET("/accounts", ac.listAccounts)
@@ -179,6 +202,19 @@ func (s *Server) registerAdminRoutes() {
 		g.PATCH("/channels/:id/enabled", h.setChannelEnabled)
 		g.DELETE("/channels/:id", h.deleteChannel)
 	}
+}
+
+// sessionVersionChecker 把 account.AccountStore 适配为 middleware.SessionVersionChecker
+// （审查 AUD-P1-17）：按会话里的 AccountID 回查账户当前代次，供鉴权比对。账户已删除
+// （ErrNotFound）时向上返回错误，由中间件 fail-closed 拒绝——账户没了，旧会话不该再有效。
+func (s *Server) sessionVersionChecker() middleware.SessionVersionChecker {
+	return middleware.SessionVersionCheckerFunc(func(ctx context.Context, accountID int64) (int, error) {
+		acc, err := s.deps.Account.GetByID(ctx, accountID)
+		if err != nil {
+			return 0, err
+		}
+		return acc.SessionVersion, nil
+	})
 }
 
 func placeholder(c *gin.Context) {

@@ -63,15 +63,16 @@ type UsageLog struct {
 // Account 对应 accounts 表：控制台登录账户（与计费实体 users 分离）。
 // PasswordHash 存 bcrypt 哈希，绝不落明文。ExternalID 对 admin 角色可空。
 type Account struct {
-	ID           int64              `json:"id"`
-	Username     string             `json:"username"`
-	PasswordHash string             `json:"password_hash"`
-	Role         string             `json:"role"`
-	ExternalID   pgtype.Text        `json:"external_id"`
-	GroupName    string             `json:"group_name"`
-	Enabled      bool               `json:"enabled"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	ID             int64              `json:"id"`
+	Username       string             `json:"username"`
+	PasswordHash   string             `json:"password_hash"`
+	Role           string             `json:"role"`
+	ExternalID     pgtype.Text        `json:"external_id"`
+	GroupName      string             `json:"group_name"`
+	Enabled        bool               `json:"enabled"`
+	SessionVersion int32              `json:"session_version"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
 // Setting 对应 settings 表：运行时可变的 KV 系统设置。

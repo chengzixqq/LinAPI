@@ -54,6 +54,27 @@ func TestSessionGetMissing(t *testing.T) {
 	}
 }
 
+// TestSessionCarriesCSRFToken 验证会话能承载 CSRFToken 字段并原样往返（审查 AUD-P1-26）。
+// CSRF token 与会话绑定：登录时生成并存入会话，写请求校验 header 是否等于此值，
+// 登出删会话即令 token 失效。session 包只负责存取，token 由 login handler 生成。
+func TestSessionCarriesCSRFToken(t *testing.T) {
+	m, _ := newTestManager(t)
+	ctx := context.Background()
+	data := SessionData{AccountID: 1, Username: "alice", Role: "user", ExternalID: "alice", CSRFToken: "csrf-abc-123"}
+
+	token, err := m.Create(ctx, data, DefaultTTL)
+	if err != nil {
+		t.Fatalf("Create 失败: %v", err)
+	}
+	got, err := m.Get(ctx, token)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if got.CSRFToken != "csrf-abc-123" {
+		t.Fatalf("CSRFToken 未往返: 得到 %q", got.CSRFToken)
+	}
+}
+
 func TestSessionExpiry(t *testing.T) {
 	m, mr := newTestManager(t)
 	ctx := context.Background()

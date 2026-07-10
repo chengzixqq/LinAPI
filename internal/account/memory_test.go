@@ -92,6 +92,45 @@ func TestMemorySetEnabledAndPassword(t *testing.T) {
 	}
 }
 
+// TestMemorySessionVersionBumpsOnDisableAndPassword 验证禁用账户与重置密码都会递增
+// session_version（审查 AUD-P1-17）：登录会话把 version 快照进 token，鉴权时比对，
+// version 一变旧会话即失效。重新启用（SetEnabled(true)）不应递增——无需踢已在线会话。
+func TestMemorySessionVersionBumpsOnDisableAndPassword(t *testing.T) {
+	m := newMemStore()
+	ctx := context.Background()
+	acc, _ := m.CreateUserAccount(ctx, "ivan", "h", 0)
+	if acc.SessionVersion != 0 {
+		t.Fatalf("新账户 session_version 应为 0, 得到 %d", acc.SessionVersion)
+	}
+
+	// 禁用 → 递增。
+	off, err := m.SetEnabled(ctx, acc.ID, false)
+	if err != nil {
+		t.Fatalf("SetEnabled(false) 失败: %v", err)
+	}
+	if off.SessionVersion != 1 {
+		t.Fatalf("禁用后 session_version 应为 1, 得到 %d", off.SessionVersion)
+	}
+
+	// 改密 → 再递增。
+	if err := m.UpdatePassword(ctx, acc.ID, "newhash"); err != nil {
+		t.Fatalf("UpdatePassword 失败: %v", err)
+	}
+	cur, _ := m.GetByID(ctx, acc.ID)
+	if cur.SessionVersion != 2 {
+		t.Fatalf("改密后 session_version 应为 2, 得到 %d", cur.SessionVersion)
+	}
+
+	// 重新启用 → 不递增（无需踢已在线会话）。
+	on, err := m.SetEnabled(ctx, acc.ID, true)
+	if err != nil {
+		t.Fatalf("SetEnabled(true) 失败: %v", err)
+	}
+	if on.SessionVersion != 2 {
+		t.Fatalf("重新启用不应递增 session_version, 应为 2, 得到 %d", on.SessionVersion)
+	}
+}
+
 func TestMemorySettings(t *testing.T) {
 	m := newMemStore()
 	ctx := context.Background()

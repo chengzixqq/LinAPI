@@ -153,6 +153,14 @@ func (h *accountConsoleHandlers) putSettings(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
 		return
 	}
+	// 纵深防御（审查 AUD-P0-07）：自助注册恒不发额度，new_user_initial_balance 已无
+	// 正向语义。拒绝正值，杜绝“设了却不生效”的脏配置误导运维以为注册会送额度。
+	// 要给用户发额度只能走管理面主动建号 / 充值。
+	if s.NewUserInitialBalance != 0 {
+		writeError(c, http.StatusBadRequest, "invalid_request_error",
+			"new_user_initial_balance 必须为 0：自助注册不发放额度，请通过管理面主动建号或充值")
+		return
+	}
 	if err := h.settings.Put(c.Request.Context(), s); err != nil {
 		writeError(c, http.StatusInternalServerError, "internal_error", "保存设置失败")
 		return
