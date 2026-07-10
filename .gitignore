@@ -1,0 +1,29 @@
+# 编译产物
+/bin/
+/dist/
+*.exe
+linapi
+
+# 本地配置（含密钥，勿提交）
+config.yaml
+*.local.yaml
+.env
+
+# 依赖 / 缓存
+/vendor/
+
+# 日志
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+*.stackdump
+
+# codegraph 本地索引
+.codegraph/

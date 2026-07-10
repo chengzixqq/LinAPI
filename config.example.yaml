@@ -1,0 +1,71 @@
+# LinAPI 网关配置示例。
+# 复制为 config.yaml 后按需修改。
+# 任意项都可用环境变量覆盖，前缀 LINAPI_，例如 LINAPI_SERVER_PORT=9000。
+
+server:
+  port: 8080
+  mode: release        # debug | release
+
+database:
+  enabled: false            # true 启用 PostgreSQL（身份/额度/用量/渠道落库）；false 走内存实现，本地开发免装 DB
+  dsn: "postgres://postgres:postgres@localhost:5432/linapi?sslmode=disable"
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime: 3600   # 秒
+  auto_migrate: true        # true 时启动期幂等建表（全部 IF NOT EXISTS）
+
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+log:
+  level: info          # debug | info | warn | error
+  format: json         # json | text
+
+# 鉴权与额度（过渡期配置，第 7 步接入数据库后退役）。
+# keys 列表驱动内存 Store：每个 API Key 映射到用户、限流阈值、可用模型与初始额度。
+auth:
+  keys:
+    - api_key: "sk-local-dev"        # 客户端用 Authorization: Bearer 或 x-api-key 传入
+      key_id: "key-dev"              # 稳定标识，用作限流维度与计费归因
+      user_id: "dev"
+      rate_limit_per_min: 60         # 每分钟请求数，<=0 表示不限流
+      allowed_models: []             # 为空表示不限制模型；如 ["gpt-4o", "claude-3-5-sonnet"]
+      enabled: true
+      initial_balance: 1000000       # 初始额度，最小计费单位
+
+# 管理面（用户/密钥/渠道 CRUD）。与业务 /v1 端点鉴权隔离。
+# 默认关闭；开启后 /admin/* 端点需用独立 token 鉴权（绝不与业务 API Key 共用）。
+admin:
+  enabled: false                   # true 时挂载 /admin/* 管理端点
+  token: ""                        # 管理令牌：客户端用 Authorization: Bearer <token> 访问；enabled=true 时不可为空
+  loopback_only: false             # true 时仅接受来自 127.0.0.1/::1 的管理请求，与 token 叠加双重防线
+  channel_reload_interval: 60      # 渠道定时热重载间隔（秒），<=0 关闭；仅 database.enabled=true 时生效
+
+# 上游渠道（过渡期配置来源）。database.enabled=true 时渠道改由 channels 表管理，
+# 本段仅在内存模式（database.enabled=false）下驱动路由引擎。
+# 路由：先按 priority 降序分组，同组内按 weight 加权随机；失败则依次故障转移到下一候选。
+channels:
+  - id: "openai-main"          # 唯一标识，用作熔断/日志/计费归因
+    name: "OpenAI 主渠道"
+    format: "openai"           # openai | anthropic，决定出向适配器
+    base_url: "https://api.openai.com"
+    api_key: "sk-your-upstream-key"
+    models:                    # 对外模型名 -> 上游实际模型名（值为空=透传）
+      gpt-4o: "gpt-4o-2024-08-06"
+      gpt-4o-mini: ""
+    priority: 10               # 越大越优先
+    weight: 1                  # 同优先级内加权随机权重（>0）
+    enabled: true
+
+  - id: "anthropic-backup"     # 可跨供应商做故障转移：OpenAI 请求可回退到 Claude
+    name: "Anthropic 备用渠道"
+    format: "anthropic"
+    base_url: "https://api.anthropic.com"
+    api_key: "sk-ant-your-upstream-key"
+    models:
+      gpt-4o: "claude-3-5-sonnet-20241022"   # 对外仍叫 gpt-4o，上游走 Claude
+    priority: 5                # 优先级更低，仅当主渠道不可用时启用
+    weight: 1
+    enabled: true

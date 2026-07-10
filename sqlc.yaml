@@ -1,0 +1,29 @@
+# sqlc 代码生成配置。
+#
+# 用法：安装 sqlc 后在项目根目录运行 `sqlc generate`，
+# 会读 db/schema.sql + db/query.sql，在 internal/db 生成类型安全的查询代码。
+#
+# 注意：本仓库当前环境无法联网安装 sqlc 二进制，internal/db 下的代码是
+# 按本文件的 sqlc（pgx/v5）配置手写的等价产物——
+# 一旦能装上 sqlc，`sqlc generate` 可原样覆盖，接口与调用方零改动。
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "db/schema.sql"
+    queries: "db/query.sql"
+    gen:
+      go:
+        package: "db"
+        out: "internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: false
+        emit_interface: true
+        emit_exact_table_names: false
+        emit_empty_slices: true
+        overrides:
+          # 金额列统一映射为 int64（最小计费单位）。
+          - column: "users.balance"
+            go_type: "int64"
+          - column: "usage_logs.cost"
+            go_type: "int64"
