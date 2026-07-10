@@ -11,14 +11,12 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"linapi/internal/admin"
-	"linapi/internal/middleware"
 	"linapi/internal/store"
 )
 
-const testAdminToken = "test-admin-token"
-
 // newAdminTestEngine 构建一个只挂 /admin 路由的 gin 引擎，复用真实的
-// adminHandlers 与 AdminAuth 中间件，但不拉起 /v1（无需 Redis/Forwarder）。
+// adminHandlers，但不挂鉴权中间件（直接测 handler 逻辑；鉴权已由
+// session_auth_test.go 覆盖），也不拉起 /v1（无需 Redis/Forwarder）。
 // 返回引擎与底层 Service，便于测试直接预置数据或断言。
 func newAdminTestEngine(t *testing.T) (*gin.Engine, *admin.Service) {
 	t.Helper()
@@ -31,7 +29,6 @@ func newAdminTestEngine(t *testing.T) (*gin.Engine, *admin.Service) {
 	h := &adminHandlers{svc: svc}
 	e := gin.New()
 	g := e.Group("/admin")
-	g.Use(middleware.AdminAuth(testAdminToken, false))
 	{
 		g.POST("/users", h.createUser)
 		g.GET("/users", h.listUsers)
@@ -51,7 +48,8 @@ func newAdminTestEngine(t *testing.T) (*gin.Engine, *admin.Service) {
 	return e, svc
 }
 
-// doAdmin 发起一次带管理令牌的请求，body 为 nil 时不带请求体。
+// doAdmin 发起一次请求，body 为 nil 时不带请求体（鉴权已在本文件的测试引擎中移除，
+// 由 session_auth_test.go 单独覆盖）。
 func doAdmin(t *testing.T, e *gin.Engine, method, path string, body any) *httptest.ResponseRecorder {
 	t.Helper()
 	var reader *bytes.Reader
@@ -65,22 +63,10 @@ func doAdmin(t *testing.T, e *gin.Engine, method, path string, body any) *httpte
 		reader = bytes.NewReader(nil)
 	}
 	req := httptest.NewRequest(method, path, reader)
-	req.Header.Set("Authorization", "Bearer "+testAdminToken)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	e.ServeHTTP(w, req)
 	return w
-}
-
-// TestAdminAuthGuardsRoutes 无令牌应被 AdminAuth 拦截为 401。
-func TestAdminAuthGuardsRoutes(t *testing.T) {
-	e, _ := newAdminTestEngine(t)
-	req := httptest.NewRequest(http.MethodGet, "/admin/users", nil)
-	w := httptest.NewRecorder()
-	e.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("无令牌应 401, 得到 %d", w.Code)
-	}
 }
 
 // TestAdminUserLifecycle 覆盖用户创建→查询→启停→充值的 HTTP 全链路。

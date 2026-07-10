@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"time"
 
+	"linapi/internal/account"
 	"linapi/internal/admin"
 	"linapi/internal/billing"
 	"linapi/internal/config"
 	"linapi/internal/forwarder"
 	"linapi/internal/middleware"
+	"linapi/internal/session"
 	"linapi/internal/store"
 
 	"github.com/gin-gonic/gin"
@@ -29,12 +31,16 @@ type Server struct {
 
 // Deps 是 Server 的外部依赖，由 main 构建后注入，便于测试替换。
 type Deps struct {
-	Store     store.Store          // 身份/额度数据访问
-	Redis     *redis.Client        // 限流等分布式状态
-	Billing   *billing.Billing     // 计费门面（预扣/结算）
-	Forwarder *forwarder.Forwarder // 转发层（适配器 + 路由 + 熔断 + 结算）
-	Admin     *admin.Service       // 管理面服务（用户/密钥/渠道 CRUD）；nil 表示不挂管理端点
-	Logger    *slog.Logger         // 结构化日志器；nil 时 RequestLogger 退化为 slog.Default()
+	Store        store.Store           // 身份/额度数据访问
+	Redis        *redis.Client         // 限流等分布式状态
+	Billing      *billing.Billing      // 计费门面（预扣/结算）
+	Forwarder    *forwarder.Forwarder  // 转发层（适配器 + 路由 + 熔断 + 结算）
+	Admin        *admin.Service        // 管理面服务（用户/密钥/渠道 CRUD）；nil 表示不挂管理端点
+	Account      account.AccountStore  // 控制台账户数据访问；nil 表示不挂控制台端点
+	Settings     account.SettingsStore // 系统设置数据访问
+	Session      *session.Manager      // 会话管理器（Redis）
+	SecureCookie bool                  // 会话 Cookie 是否加 Secure 属性（生产 HTTPS 置 true）
+	Logger       *slog.Logger          // 结构化日志器；nil 时 RequestLogger 退化为 slog.Default()
 }
 
 // New 构建一个 Server，注册中间件与路由，但不启动监听。
@@ -96,19 +102,81 @@ func (s *Server) registerRoutes() {
 		v1.GET("/models", s.listModels)
 	}
 
+	s.registerAuthRoutes()
+	s.registerMeRoutes()
 	s.registerAdminRoutes()
+}
+
+// registerAuthRoutes 挂载 /auth 分组（注册/登录/登出/me）。
+// 仅当 admin.enabled=true 且注入了账户体系依赖时生效。
+func (s *Server) registerAuthRoutes() {
+	if !s.cfg.Admin.Enabled || s.deps.Account == nil || s.deps.Session == nil {
+		return
+	}
+	h := newAuthHandlers(s.deps.Account, s.deps.Settings, s.deps.Session, s.deps.SecureCookie)
+	g := s.engine.Group("/auth")
+	g.POST("/register", h.register)
+	g.POST("/login", h.login)
+	g.POST("/logout", middleware.SessionAuth(s.deps.Session), h.logout)
+	g.GET("/me", middleware.SessionAuth(s.deps.Session), h.me)
+}
+
+// registerMeRoutes 挂载 /me 分组（用户自助）。需登录（任意角色）。
+func (s *Server) registerMeRoutes() {
+	if !s.cfg.Admin.Enabled || s.deps.Account == nil || s.deps.Session == nil || s.deps.Admin == nil {
+		return
+	}
+	h := newMeHandlers(s.deps.Admin, s.deps.Store)
+	g := s.engine.Group("/me", middleware.SessionAuth(s.deps.Session))
+	g.GET("/profile", h.profile)
+	g.GET("/keys", h.listKeys)
+	g.POST("/keys", h.createKey)
+	g.PATCH("/keys/:keyid/enabled", h.setKeyEnabled)
+	g.DELETE("/keys/:keyid", h.deleteKey)
 }
 
 // registerAdminRoutes 挂载管理面 /admin 分组。
 //
-// TODO(Task 14): 本函数在 Task 9 移除 Admin.Token/LoopbackOnly 后处于过渡态。
-// 旧的 AdminAuth（裸 token）已不再适用；Task 14 将把 /admin 重新挂到
-// SessionAuth + RequireRole("admin") 之下（与 /auth、/me 一致的会话鉴权）。
-// 过渡期间暂不挂载 /admin 路由——绝不以「无鉴权」形式暴露管理端点。
-// 注意：既有 admin_handlers_test.go 自建 gin 引擎测试各 handler，不依赖本函数。
+// 鉴权改为「会话 + admin 角色」（替换 Task 9 移除的裸 token AdminAuth）：
+// 先 SessionAuth 校验登录会话，再 RequireRole 校验角色为 admin，缺一不可。
 func (s *Server) registerAdminRoutes() {
-	// 过渡期空实现：Task 14 恢复挂载（改用会话鉴权）。
-	_ = s.deps.Admin
+	if !s.cfg.Admin.Enabled || s.deps.Admin == nil || s.deps.Session == nil {
+		return
+	}
+
+	h := &adminHandlers{svc: s.deps.Admin}
+	ac := newAccountConsoleHandlers(s.deps.Account, s.deps.Settings)
+	// 管理面改「会话 + admin 角色」鉴权（替换裸 token）。
+	g := s.engine.Group("/admin", middleware.SessionAuth(s.deps.Session), middleware.RequireRole(account.RoleAdmin))
+	{
+		// 账户与系统设置
+		g.GET("/accounts", ac.listAccounts)
+		g.POST("/accounts", ac.createAccount)
+		g.PATCH("/accounts/:id/enabled", ac.setAccountEnabled)
+		g.POST("/accounts/:id/password", ac.resetPassword)
+		g.GET("/settings", ac.getSettings)
+		g.PUT("/settings", ac.putSettings)
+
+		// 计费用户
+		g.POST("/users", h.createUser)
+		g.GET("/users", h.listUsers)
+		g.GET("/users/:id", h.getUser)
+		g.PATCH("/users/:id/enabled", h.setUserEnabled)
+		g.POST("/users/:id/balance", h.addBalance)
+
+		// 密钥（挂在用户下）
+		g.POST("/users/:id/keys", h.createKey)
+		g.GET("/users/:id/keys", h.listKeys)
+		g.PATCH("/keys/:keyid/enabled", h.setKeyEnabled)
+
+		// 渠道
+		g.POST("/channels", h.createChannel)
+		g.GET("/channels", h.listChannels)
+		g.GET("/channels/:id", h.getChannel)
+		g.PUT("/channels/:id", h.updateChannel)
+		g.PATCH("/channels/:id/enabled", h.setChannelEnabled)
+		g.DELETE("/channels/:id", h.deleteChannel)
+	}
 }
 
 func placeholder(c *gin.Context) {
