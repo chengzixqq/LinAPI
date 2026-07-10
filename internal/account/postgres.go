@@ -135,6 +135,12 @@ func (s *PGStore) SetEnabled(ctx context.Context, id int64, enabled bool) (Accou
 }
 
 func (s *PGStore) UpdatePassword(ctx context.Context, id int64, passwordHash string) error {
+	// UpdateAccountPassword 是 :exec 语义，UPDATE 匹配 0 行也返回 nil，
+	// 故先 GetAccountByID 确认账户存在（不存在时 mapErr 归一为 ErrNotFound），
+	// 存在才执行更新。参考 internal/admin/postgres.go 的 AddBalance。
+	if _, err := s.q.GetAccountByID(ctx, id); err != nil {
+		return mapErr(err)
+	}
 	return mapErr(s.q.UpdateAccountPassword(ctx, db.UpdateAccountPasswordParams{ID: id, PasswordHash: passwordHash}))
 }
 
