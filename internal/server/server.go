@@ -110,7 +110,7 @@ func (s *Server) registerRoutes() {
 // registerAuthRoutes 挂载 /auth 分组（注册/登录/登出/me）。
 // 仅当 admin.enabled=true 且注入了账户体系依赖时生效。
 func (s *Server) registerAuthRoutes() {
-	if !s.cfg.Admin.Enabled || s.deps.Account == nil || s.deps.Session == nil {
+	if !s.cfg.Admin.Enabled || s.deps.Account == nil || s.deps.Settings == nil || s.deps.Session == nil {
 		return
 	}
 	h := newAuthHandlers(s.deps.Account, s.deps.Settings, s.deps.Session, s.deps.SecureCookie)
@@ -140,7 +140,7 @@ func (s *Server) registerMeRoutes() {
 // 鉴权改为「会话 + admin 角色」（替换 Task 9 移除的裸 token AdminAuth）：
 // 先 SessionAuth 校验登录会话，再 RequireRole 校验角色为 admin，缺一不可。
 func (s *Server) registerAdminRoutes() {
-	if !s.cfg.Admin.Enabled || s.deps.Admin == nil || s.deps.Session == nil {
+	if !s.cfg.Admin.Enabled || s.deps.Admin == nil || s.deps.Account == nil || s.deps.Settings == nil || s.deps.Session == nil {
 		return
 	}
 
