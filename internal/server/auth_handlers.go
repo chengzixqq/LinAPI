@@ -13,7 +13,17 @@ import (
 
 // dummyPasswordHash 是一枚固定的 bcrypt 哈希，用于账户不存在时仍执行一次等价的密码比较，
 // 抹平「账户存在」与「不存在」之间的响应耗时差异，堵住基于计时的用户名枚举侧信道。
-var dummyPasswordHash, _ = account.HashPassword("linapi-timing-guard-placeholder")
+// 占位串远超最小长度，HashPassword 不应失败；万一失败则在启动期 panic 而非让登录路径
+// 静默拿到空哈希（那会使侧信道防护失效），fail-fast 优于静默降级。
+var dummyPasswordHash = mustHashPassword("linapi-timing-guard-placeholder")
+
+func mustHashPassword(plain string) string {
+	h, err := account.HashPassword(plain)
+	if err != nil {
+		panic("server: 生成 dummy 密码哈希失败: " + err.Error())
+	}
+	return h
+}
 
 // authHandlers 聚合 /auth 端点的处理器。
 type authHandlers struct {
