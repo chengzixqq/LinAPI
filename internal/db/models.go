@@ -9,6 +9,9 @@ type User struct {
 	ID         int64              `json:"id"`
 	ExternalID string             `json:"external_id"`
 	Balance    int64              `json:"balance"`
+	// RateMultiplier 是预留的单用户定价倍率（百分比，100=1.00x）；本期存而不用，
+	// 现有查询不 select 该列，故此字段暂不参与任何 Scan。
+	RateMultiplier int32              `json:"rate_multiplier"`
 	Enabled    bool               `json:"enabled"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
@@ -55,4 +58,25 @@ type UsageLog struct {
 	OutputTokens int32              `json:"output_tokens"`
 	Cost         int64              `json:"cost"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+// Account 对应 accounts 表：控制台登录账户（与计费实体 users 分离）。
+// PasswordHash 存 bcrypt 哈希，绝不落明文。ExternalID 对 admin 角色可空。
+type Account struct {
+	ID           int64              `json:"id"`
+	Username     string             `json:"username"`
+	PasswordHash string             `json:"password_hash"`
+	Role         string             `json:"role"`
+	ExternalID   pgtype.Text        `json:"external_id"`
+	GroupName    string             `json:"group_name"`
+	Enabled      bool               `json:"enabled"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+}
+
+// Setting 对应 settings 表：运行时可变的 KV 系统设置。
+type Setting struct {
+	Key       string             `json:"key"`
+	Value     string             `json:"value"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }

@@ -137,6 +137,52 @@ RETURNING id, channel_id, name, format, base_url, api_key, models, priority, wei
 DELETE FROM channels
 WHERE channel_id = $1;
 
+-- ============================ accounts ============================
+
+-- name: CreateAccount :one
+INSERT INTO accounts (username, password_hash, role, external_id)
+VALUES ($1, $2, $3, $4)
+RETURNING id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at;
+
+-- name: GetAccountByUsername :one
+-- 按登录名取账户（登录校验用）。
+SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+FROM accounts WHERE username = $1;
+
+-- name: GetAccountByID :one
+SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+FROM accounts WHERE id = $1;
+
+-- name: ListAccounts :many
+-- 管理面：分页列出账户。
+SELECT id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at
+FROM accounts ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2;
+
+-- name: CountAccounts :one
+-- 统计账户数（概览页与 bootstrap 判断用）。
+SELECT count(*) FROM accounts;
+
+-- name: SetAccountEnabled :one
+-- 启停账户。
+UPDATE accounts SET enabled = $2, updated_at = now()
+WHERE id = $1
+RETURNING id, username, password_hash, role, external_id, group_name, enabled, created_at, updated_at;
+
+-- name: UpdateAccountPassword :exec
+-- 改密（存新的 bcrypt 哈希）。
+UPDATE accounts SET password_hash = $2, updated_at = now() WHERE id = $1;
+
+-- ============================ settings ============================
+
+-- name: GetSetting :one
+-- 取单个设置项。
+SELECT key, value, updated_at FROM settings WHERE key = $1;
+
+-- name: UpsertSetting :exec
+-- 写入/更新设置项（幂等）。
+INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
+
 -- ============================ usage_logs ============================
 
 -- name: InsertUsageLog :exec
