@@ -64,8 +64,22 @@ func TestAdminAccountResponseHasNoPasswordHash(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	e.ServeHTTP(w, req)
+	// 先坐实请求成功，否则「错误响应恰好不含 password_hash」会让本测试假性通过。
+	if w.Code != http.StatusCreated {
+		t.Fatalf("建 admin 账户应 201, 得到 %d; body=%s", w.Code, w.Body.String())
+	}
 	if bytesContainsAny(w.Body.Bytes(), "password_hash", "PasswordHash") {
 		t.Error("账户响应不得含 password_hash")
+	}
+	// 角色分流断言：admin 请求必须真的建成 admin（走 CreateAccount，无计费实体 external_id），
+	// 而非被误路由进 CreateUserAccount 静默降级为 user。
+	var got map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got["role"] != "admin" {
+		t.Fatalf("admin 请求应建成 role=admin, 得到 %v", got["role"])
+	}
+	if ext, _ := got["external_id"].(string); ext != "" {
+		t.Fatalf("admin 账户不应有计费实体 external_id, 得到 %q", ext)
 	}
 }
 
