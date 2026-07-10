@@ -162,3 +162,16 @@ func (q *Queries) SetAPIKeyEnabled(ctx context.Context, arg SetAPIKeyEnabledPara
 	)
 	return i, err
 }
+
+const deleteAPIKey = `-- name: DeleteAPIKey :execrows
+DELETE FROM api_keys WHERE key_id = $1
+`
+
+// DeleteAPIKey 按 key_id 物理删除密钥，返回受影响行数（0 表示不存在）。
+func (q *Queries) DeleteAPIKey(ctx context.Context, keyID string) (int64, error) {
+	ct, err := q.db.Exec(ctx, deleteAPIKey, keyID)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}

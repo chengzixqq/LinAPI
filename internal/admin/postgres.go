@@ -168,6 +168,17 @@ func (s *PGStore) SetAPIKeyEnabled(ctx context.Context, keyID string, enabled bo
 	}, nil
 }
 
+func (s *PGStore) DeleteAPIKey(ctx context.Context, keyID string) error {
+	n, err := s.q.DeleteAPIKey(ctx, keyID)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ---- 渠道 ----
 
 func (s *PGStore) CreateChannel(ctx context.Context, in ChannelInput) (Channel, error) {

@@ -267,6 +267,25 @@ func (s *MemoryStore) AdminSetKeyEnabled(keyID string, enabled bool) (MemKeyView
 	}, nil
 }
 
+// AdminDeleteKey 物理删除密钥（按 keyID）；不存在返回 ErrKeyNotFound。
+func (s *MemoryStore) AdminDeleteKey(keyID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.keyByID[keyID]
+	if !ok {
+		return ErrKeyNotFound
+	}
+	delete(s.keyByID, keyID)
+	// 同步删除明文 key 索引（找到指向同一 Identity 的条目）。
+	for k, v := range s.keys {
+		if v == id {
+			delete(s.keys, k)
+			break
+		}
+	}
+	return nil
+}
+
 // paginate 对切片应用 limit/offset（limit<=0 表示不限制）。
 func paginate(views []MemUserView, limit, offset int) []MemUserView {
 	if offset < 0 {

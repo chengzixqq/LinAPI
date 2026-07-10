@@ -82,6 +82,11 @@ SET enabled = $2
 WHERE key_id = $1
 RETURNING id, key_id, user_external_id, rate_limit_per_min, allowed_models, enabled, created_at;
 
+-- name: DeleteAPIKey :execrows
+-- 管理面：物理删除密钥，返回受影响行数（0 表示不存在）。
+DELETE FROM api_keys
+WHERE key_id = $1;
+
 -- ============================ channels ============================
 
 -- name: ListEnabledChannels :many

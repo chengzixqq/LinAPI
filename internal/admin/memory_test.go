@@ -131,6 +131,17 @@ func TestMemoryAPIKeyCRUD(t *testing.T) {
 	if _, err := m.SetAPIKeyEnabled(ctx, "ghost", true); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("启停不存在密钥应 ErrNotFound, 得到 %v", err)
 	}
+
+	// 删除密钥。
+	if err := m.DeleteAPIKey(ctx, "k1"); err != nil {
+		t.Fatalf("DeleteAPIKey 失败: %v", err)
+	}
+	if keys, _ := m.ListAPIKeysByUser(ctx, "u1"); len(keys) != 0 {
+		t.Fatalf("删除后应无密钥, 得到 %d 个", len(keys))
+	}
+	if err := m.DeleteAPIKey(ctx, "k1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("删除不存在密钥应 ErrNotFound, 得到 %v", err)
+	}
 }
 
 // TestMemoryKeyVisibleToHotPath 验证管理面创建的密钥能被热路径 store.Store 即时读到

@@ -19,6 +19,7 @@ type Querier interface {
 	CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (ApiKey, error)
 	ListAPIKeysByUser(ctx context.Context, userExternalID string) ([]ListAPIKeysByUserRow, error)
 	SetAPIKeyEnabled(ctx context.Context, arg SetAPIKeyEnabledParams) (ListAPIKeysByUserRow, error)
+	DeleteAPIKey(ctx context.Context, keyID string) (int64, error)
 	// channels
 	ListEnabledChannels(ctx context.Context) ([]ListEnabledChannelsRow, error)
 	CreateChannel(ctx context.Context, arg CreateChannelParams) (Channel, error)

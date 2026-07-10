@@ -116,6 +116,10 @@ func (m *MemoryStore) SetAPIKeyEnabled(_ context.Context, keyID string, enabled 
 	return keyFromView(v), nil
 }
 
+func (m *MemoryStore) DeleteAPIKey(_ context.Context, keyID string) error {
+	return mapUserErr(m.base.AdminDeleteKey(keyID))
+}
+
 // ---- 渠道 ----
 
 func (m *MemoryStore) CreateChannel(_ context.Context, in ChannelInput) (Channel, error) {

@@ -101,6 +101,8 @@ type AdminStore interface {
 	CreateAPIKey(ctx context.Context, in CreateAPIKeyInput) (APIKey, error)
 	ListAPIKeysByUser(ctx context.Context, userID string) ([]APIKey, error)
 	SetAPIKeyEnabled(ctx context.Context, keyID string, enabled bool) (APIKey, error)
+	// DeleteAPIKey 物理删除密钥；不存在返回 ErrNotFound。
+	DeleteAPIKey(ctx context.Context, keyID string) error
 
 	// ---- 渠道 ----
 	CreateChannel(ctx context.Context, in ChannelInput) (Channel, error)
