@@ -45,9 +45,23 @@ func (h *meHandlers) ownedKey(c *gin.Context, keyID string) (admin.APIKey, bool)
 	return admin.APIKey{}, false
 }
 
+// requireExternalID 取当前会话的计费实体标识；无会话（ext 为空）时写 401 并返回 false。
+// 所有自助端点都应经此闸——fail-closed：宁可拒绝，也不以空身份返回默认数据。
+func (h *meHandlers) requireExternalID(c *gin.Context) (string, bool) {
+	ext := h.sessionExternalID(c)
+	if ext == "" {
+		writeError(c, http.StatusUnauthorized, "authentication_error", "未登录")
+		return "", false
+	}
+	return ext, true
+}
+
 // profile 返回当前用户账户信息 + 余额。
 func (h *meHandlers) profile(c *gin.Context) {
-	ext := h.sessionExternalID(c)
+	ext, ok := h.requireExternalID(c)
+	if !ok {
+		return
+	}
 	bal, err := h.store.Balance(c.Request.Context(), ext)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "internal_error", "读取余额失败")
@@ -58,7 +72,10 @@ func (h *meHandlers) profile(c *gin.Context) {
 
 // listKeys 列出当前用户的密钥（脱敏，不含明文）。
 func (h *meHandlers) listKeys(c *gin.Context) {
-	ext := h.sessionExternalID(c)
+	ext, ok := h.requireExternalID(c)
+	if !ok {
+		return
+	}
 	keys, err := h.svc.Store().ListAPIKeysByUser(c.Request.Context(), ext)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "internal_error", "读取密钥失败")
@@ -75,9 +92,8 @@ type meCreateKeyReq struct {
 
 // createKey 自助建 key，绑定用户强制取自会话，明文仅回显一次。
 func (h *meHandlers) createKey(c *gin.Context) {
-	ext := h.sessionExternalID(c)
-	if ext == "" {
-		writeError(c, http.StatusUnauthorized, "authentication_error", "未登录")
+	ext, ok := h.requireExternalID(c)
+	if !ok {
 		return
 	}
 	var req meCreateKeyReq

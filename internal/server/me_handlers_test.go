@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -104,5 +105,67 @@ func TestMeProfileReturnsBalance(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
 	if got["external_id"] != "me" {
 		t.Fatalf("profile external_id 不符: %+v", got)
+	}
+	// 余额必须为会话用户 me 的充值额 888（JSON 数字反序列化为 float64）。
+	if got["balance"] != float64(888) {
+		t.Fatalf("profile balance 应为 888, 得到 %v", got["balance"])
+	}
+}
+
+// TestMeListKeysReturnsOwnOnly 验证 GET /me/keys 只返回会话用户自己的 key，且不含明文。
+func TestMeListKeysReturnsOwnOnly(t *testing.T) {
+	e, svc := newMeTestEngine(t, "me")
+	// me 一把、other 一把。
+	genMe, _ := admin.GenerateKey()
+	_, _ = svc.Store().CreateAPIKey(context.Background(), admin.CreateAPIKeyInput{
+		APIKey: genMe.APIKey, KeyID: "me-key", UserID: "me", Enabled: true,
+	})
+	genOther, _ := admin.GenerateKey()
+	_, _ = svc.Store().CreateAPIKey(context.Background(), admin.CreateAPIKeyInput{
+		APIKey: genOther.APIKey, KeyID: "other-key", UserID: "other", Enabled: true,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/me/keys", nil)
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("列 key 应 200, 得到 %d", w.Code)
+	}
+	// 只应含自己的 me-key，绝不含他人 other-key。
+	body := w.Body.String()
+	if !strings.Contains(body, "me-key") {
+		t.Fatalf("应含自己的 me-key: %s", body)
+	}
+	if strings.Contains(body, "other-key") {
+		t.Fatalf("绝不应含他人 other-key（越权泄露）: %s", body)
+	}
+	// 不得回显明文 api_key。
+	if strings.Contains(body, genMe.APIKey) {
+		t.Fatalf("列表不应回显明文 api_key")
+	}
+}
+
+// TestMeFailsClosedWithoutSession 验证无会话（未挂 SessionAuth/ext 为空）时自助端点 fail-closed 返回 401，
+// 而非以空身份静默返回默认数据。
+func TestMeFailsClosedWithoutSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := store.NewMemoryStore(nil)
+	as := admin.NewMemoryStore(base, nil)
+	svc := admin.NewService(as, nil, nil)
+	h := newMeHandlers(svc, base)
+
+	// 刻意不注入任何会话（模拟漏挂 SessionAuth 或空 ext）。
+	e := gin.New()
+	g := e.Group("/me")
+	g.GET("/profile", h.profile)
+	g.GET("/keys", h.listKeys)
+
+	for _, path := range []string{"/me/profile", "/me/keys"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		e.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("%s 无会话应 401(fail-closed), 得到 %d", path, w.Code)
+		}
 	}
 }
