@@ -98,6 +98,105 @@ func TestLoginWrongPassword(t *testing.T) {
 	}
 }
 
+func TestLoginCookieAttributes(t *testing.T) {
+	e, accStore, _ := newAuthTestEngine(t)
+	hash, _ := account.HashPassword("password123")
+	_, _ = accStore.CreateAccount(context.Background(), account.CreateAccountInput{
+		Username: "dave", PasswordHash: hash, Role: account.RoleAdmin,
+	})
+
+	body, _ := json.Marshal(gin.H{"username": "dave", "password": "password123"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytesReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("登录应 200, 得到 %d", w.Code)
+	}
+
+	var sessionCookie *http.Cookie
+	for _, ck := range w.Result().Cookies() {
+		if ck.Name == middleware.CookieName {
+			sessionCookie = ck
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatal("未找到会话 Cookie")
+	}
+	if !sessionCookie.HttpOnly {
+		t.Fatal("会话 Cookie 应为 HttpOnly")
+	}
+	if sessionCookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("会话 Cookie SameSite 应为 Strict, 得到 %v", sessionCookie.SameSite)
+	}
+}
+
+func TestLoginDisabledAccount(t *testing.T) {
+	e, accStore, _ := newAuthTestEngine(t)
+	hash, _ := account.HashPassword("password123")
+	acc, err := accStore.CreateAccount(context.Background(), account.CreateAccountInput{
+		Username: "eve", PasswordHash: hash, Role: account.RoleUser,
+	})
+	if err != nil {
+		t.Fatalf("建账户失败: %v", err)
+	}
+	if _, err := accStore.SetEnabled(context.Background(), acc.ID, false); err != nil {
+		t.Fatalf("禁用账户失败: %v", err)
+	}
+
+	body, _ := json.Marshal(gin.H{"username": "eve", "password": "password123"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytesReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("禁用账户登录应 401, 得到 %d", w.Code)
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("用户名或密码错误")) {
+		t.Fatalf("禁用账户的错误消息应与密码错误一致, 得到 body=%s", w.Body.String())
+	}
+}
+
+func TestLogoutClearsSession(t *testing.T) {
+	e, accStore, _ := newAuthTestEngine(t)
+	hash, _ := account.HashPassword("password123")
+	_, _ = accStore.CreateAccount(context.Background(), account.CreateAccountInput{
+		Username: "frank", PasswordHash: hash, Role: account.RoleAdmin,
+	})
+
+	login, _ := json.Marshal(gin.H{"username": "frank", "password": "password123"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", bytesReader(login))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("登录应 200, 得到 %d", w.Code)
+	}
+	cookies := w.Result().Cookies()
+
+	req = httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, ck := range cookies {
+		req.AddCookie(ck)
+	}
+	w = httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("登出应 200, 得到 %d; body=%s", w.Code, w.Body.String())
+	}
+
+	// 同一个 Cookie 再访问 /auth/me，会话应已被删除。
+	req = httptest.NewRequest(http.MethodGet, "/auth/me", nil)
+	for _, ck := range cookies {
+		req.AddCookie(ck)
+	}
+	w = httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("登出后 /auth/me 应 401, 得到 %d", w.Code)
+	}
+}
+
 func TestMeReturnsIdentity(t *testing.T) {
 	e, accStore, _ := newAuthTestEngine(t)
 	hash, _ := account.HashPassword("password123")

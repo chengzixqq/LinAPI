@@ -11,6 +11,10 @@ import (
 	"linapi/internal/session"
 )
 
+// dummyPasswordHash 是一枚固定的 bcrypt 哈希，用于账户不存在时仍执行一次等价的密码比较，
+// 抹平「账户存在」与「不存在」之间的响应耗时差异，堵住基于计时的用户名枚举侧信道。
+var dummyPasswordHash, _ = account.HashPassword("linapi-timing-guard-placeholder")
+
 // authHandlers 聚合 /auth 端点的处理器。
 type authHandlers struct {
 	accounts     account.AccountStore
@@ -80,8 +84,14 @@ func (h *authHandlers) login(c *gin.Context) {
 		return
 	}
 	cred, err := h.accounts.GetCredentials(c.Request.Context(), req.Username)
-	if err != nil || !cred.Enabled || !account.CheckPassword(cred.PasswordHash, req.Password) {
-		// 统一错误，不区分「用户不存在」与「密码错误」，避免用户名枚举。
+	// 恒定工作量：账户不存在时也拿 dummy hash 比一次，消除计时侧信道（防用户名枚举）。
+	hashToCheck := dummyPasswordHash
+	if err == nil {
+		hashToCheck = cred.PasswordHash
+	}
+	passOK := account.CheckPassword(hashToCheck, req.Password)
+	if err != nil || !cred.Enabled || !passOK {
+		// 统一错误，不区分「用户不存在」「账户禁用」「密码错误」，避免用户名枚举。
 		writeError(c, http.StatusUnauthorized, "authentication_error", "用户名或密码错误")
 		return
 	}
