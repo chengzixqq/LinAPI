@@ -144,6 +144,36 @@ func TestMemoryAPIKeyCRUD(t *testing.T) {
 	}
 }
 
+// TestMemoryDeleteKeyRevokesResolve 验证删除密钥后，热路径再也无法用明文 key 解析出身份
+// ——双索引（keyByID + 明文 keys）必须同步清除，否则被删的 key 仍能通过 ResolveKey 通过鉴权（越权漏洞）。
+func TestMemoryDeleteKeyRevokesResolve(t *testing.T) {
+	base := store.NewMemoryStore(nil)
+	m := NewMemoryStore(base, nil)
+	ctx := context.Background()
+
+	if _, err := m.CreateUser(ctx, CreateUserInput{ExternalID: "u1", Balance: 1000, Enabled: true}); err != nil {
+		t.Fatalf("建用户失败: %v", err)
+	}
+	if _, err := m.CreateAPIKey(ctx, CreateAPIKeyInput{
+		APIKey: "sk-live", KeyID: "k1", UserID: "u1", Enabled: true,
+	}); err != nil {
+		t.Fatalf("建密钥失败: %v", err)
+	}
+
+	// 删除前：热路径可解析。
+	if _, err := base.ResolveKey(ctx, "sk-live"); err != nil {
+		t.Fatalf("删除前热路径应可解析: %v", err)
+	}
+
+	// 删除后：明文 key 必须再也解析不出身份（明文索引被同步清除）。
+	if err := m.DeleteAPIKey(ctx, "k1"); err != nil {
+		t.Fatalf("DeleteAPIKey 失败: %v", err)
+	}
+	if _, err := base.ResolveKey(ctx, "sk-live"); !errors.Is(err, store.ErrKeyNotFound) {
+		t.Fatalf("删除后明文 key 仍可解析（越权漏洞！）应 ErrKeyNotFound, 得到 %v", err)
+	}
+}
+
 // TestMemoryKeyVisibleToHotPath 验证管理面创建的密钥能被热路径 store.Store 即时读到
 // （共享同一份底层数据，这是内存模式的关键契约）。
 func TestMemoryKeyVisibleToHotPath(t *testing.T) {
