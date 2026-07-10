@@ -93,12 +93,14 @@ curl http://localhost:8080/healthz   # {"status":"ok"}
 ## 目录约定
 
 - `cmd/linapi/`：入口，负责配置加载、启动、渠道加载喂给 router、渠道定时热重载 goroutine（DB 模式）、SIGINT/SIGTERM 优雅关闭（30s 超时）。空导入 `_ "linapi/internal/adapter/all"` 触发适配器注册。
-- `internal/server/`：Gin 服务器与路由。全局挂 `RequestLogger`（结构化访问日志）+ `Metrics()`；`/healthz`、`/metrics` 不走鉴权也不记访问日志；`/v1/chat/completions`（openai）与 `/v1/messages`（anthropic）由 `Forwarder.Handler` 处理，`/v1/models` 聚合渠道模型；`/admin/*`（可选，`admin.enabled`）受独立 `AdminAuth` 守护。**注意**：HTTP server 故意不设 `WriteTimeout`——流式（SSE）响应可能持续数分钟，写超时会中途掐断长回复。
+- `internal/server/`：Gin 服务器与路由。全局挂 `RequestLogger`（结构化访问日志）+ `Metrics()`；`/healthz`、`/metrics` 不走鉴权也不记访问日志；`/v1/chat/completions`（openai）与 `/v1/messages`（anthropic）由 `Forwarder.Handler` 处理，`/v1/models` 聚合渠道模型；控制台端点 `/auth`（注册/登录/登出）、`/me`（用户自助）、`/admin/*`（可选，`admin.enabled`）由会话鉴权守护（`/admin` 需 admin 角色）。**注意**：HTTP server 故意不设 `WriteTimeout`——流式（SSE）响应可能持续数分钟，写超时会中途掐断长回复。
 - `internal/forwarder/`：转发层胶水，把适配器 + 路由 + 熔断 + 计费串起来真正发上游 HTTP，是唯一发起网络请求的地方。同格式无重命名时走直通（逐字节透传，短路 canonical 往返）。复用 `middleware` 注入的 request_id，并回填 model/channel/usage 到访问日志。
-- `internal/middleware/`：HTTP 中间件——Auth / RateLimit / Quota（挂 `/v1`）、AdminAuth（守护 `/admin`）、Metrics + RequestLogger（全局）。`RequestLogger` 分配/复用 request_id 并输出结构化访问日志（模型/渠道/用量由转发层回填）。
+- `internal/middleware/`：HTTP 中间件——Auth / RateLimit / Quota（挂 `/v1`）、SessionAuth / RequireRole（守护 `/me` 与 `/admin`）、Metrics + RequestLogger（全局）。`RequestLogger` 分配/复用 request_id 并输出结构化访问日志（模型/渠道/用量由转发层回填）。
 - `internal/admin/`：管理面服务（用户/密钥/渠道 CRUD），渠道写操作触发 router 热更新。
+- `internal/account/`：控制台账户认证领域（登录账户/角色/系统设置，与计费实体解耦），bcrypt 密码哈希，内存/PG 双实现（建 user 账户原子连带计费实体）。
+- `internal/session/`：Redis 会话管理（不透明会话 ID + TTL + 记住我），控制台登录态载体。
 - `internal/metrics/`：Prometheus 指标定义与埋点辅助函数。
-- `internal/config/`：Viper 配置，含 Server / Database / Redis / Log / Auth / Billing / Channels / Admin 八段。
+- `internal/config/`：Viper 配置，含 Server / Database / Redis / Log / Auth / Billing / Channels / Admin 八段（Admin 段自控制台后端起改为 `bootstrap` 首个管理员播种 + 会话鉴权，去除裸 token）。
 
 ## 开发进度
 
@@ -106,8 +108,10 @@ curl http://localhost:8080/healthz   # {"status":"ok"}
 
 **转发层已接线**（收尾核心）：`internal/forwarder` 把适配器 + 路由 + 熔断 + 计费串成真正发 HTTP 的 handler，请求可端到端跑通（非流式 + 流式 SSE，含跨供应商故障转移）。已接线三处：适配器 blank-import（经 `internal/adapter/all` 汇总包）、启动时加载渠道喂给 router、`/v1` 端点由转发层处理（替换 501 占位）。计费在转发终局结算：成功且有用量调 `billing.Settle` 退差 + 记用量，否则 `billing.Refund` 退押金。
 
-**运维增强（第 8 步之后）**：⑨ 管理面 CRUD（`internal/admin` + `/admin` 分组，用户/密钥/渠道，独立 `AdminAuth` 鉴权；渠道写操作即时热更新 router + DB 模式定时重载兜底多实例）⑩ Prometheus 指标（`internal/metrics` + `/metrics`，HTTP/上游/熔断埋点，标签基数可控）⑪ `/v1/models`（从启用渠道聚合对外模型名）⑫ 同格式直通（客户端格式==渠道格式且无重命名时短路 canonical 往返、逐字节透传，保真且省编解码；仍解码提取 usage 计费）⑬ 结构化访问日志（`middleware.RequestLogger`，request_id 贯通并与用量日志对账，输出模型/渠道/用量/耗时；管理面 + 中间件测试补全，全过 -race）。
+**运维增强（第 8 步之后）**：⑨ 管理面 CRUD（`internal/admin` + `/admin` 分组，用户/密钥/渠道；渠道写操作即时热更新 router + DB 模式定时重载兜底多实例）⑩ Prometheus 指标（`internal/metrics` + `/metrics`，HTTP/上游/熔断埋点，标签基数可控）⑪ `/v1/models`（从启用渠道聚合对外模型名）⑫ 同格式直通（客户端格式==渠道格式且无重命名时短路 canonical 往返、逐字节透传，保真且省编解码；仍解码提取 usage 计费）⑬ 结构化访问日志（`middleware.RequestLogger`，request_id 贯通并与用量日志对账，输出模型/渠道/用量/耗时；管理面 + 中间件测试补全，全过 -race）。
 
-> **后续可选增强（非阻塞）**：分布式追踪（OpenTelemetry span 传播）、管理面鉴权强化（多账号/RBAC/审计）、更多供应商适配器（Gemini 等）。详见 [docs/progress.md](docs/progress.md)。
+**统一账户认证体系（控制台后端，第 14 步）**：⑭ 把管理面从裸 token 升级为「账号密码 + 会话」的多账户体系。`internal/account`（登录账户/角色/系统设置双实现，与计费实体解耦，建 user 账户原子连带计费实体）+ `internal/session`（Redis 会话）+ `middleware.SessionAuth`/`RequireRole`（fail-closed）。端点：`/auth`（注册受开关约束/登录/登出/me）、`/me`（用户自助，越权硬约束——操作他人 key 返回 404）、`/admin/accounts` + `/admin/settings`。`/admin` 改会话+admin 角色鉴权，`AdminAuth` 裸 token 彻底退役。启动 `bootstrapAdmin` 幂等播种首个管理员（拒空密码、日志不记密码）。密码 bcrypt、schema 双写（accounts/settings 表 + users.rate_multiplier）。附带修复 `.gitignore` 误伤 `cmd/linapi/` 的裸 `linapi` 规则。全过 -race。
+
+> **后续可选增强（非阻塞）**：控制台前端（Plan 2：登录页/管理台/用户面板）、分布式追踪（OpenTelemetry）、认证增强（审计日志/更细 RBAC/CSRF/匿名注册限流）、更多供应商适配器（Gemini 等）。详见 [docs/progress.md](docs/progress.md)。
 
 `docs/` 目录有更详细的架构与进度记录，新窗口接手可先读那里。

@@ -105,11 +105,22 @@ canonical 被设计成**各家格式的超集**（content-block 结构，接近 
 
 ## 管理面与渠道热更新
 
-`internal/admin` 提供用户/密钥/渠道的 CRUD，挂在受独立鉴权保护的 `/admin` 分组。三条设计取向：
+`internal/admin` 提供用户/密钥/渠道的 CRUD，挂在受会话+角色鉴权保护的 `/admin` 分组。三条设计取向：
 
-- **鉴权彻底隔离**：`/admin` 用独立的 `AdminAuth`（自有 token + 可选回环限制），与 `/v1` 的业务密钥鉴权互不相通——管理令牌泄漏不影响业务密钥，反之亦然。`admin.enabled` 默认关闭（最小暴露面），开启但未配 token 则启动报错，绝不允许无鉴权的管理面。
+- **鉴权走控制台会话**：`/admin` 用 `SessionAuth` + `RequireRole(admin)`（详见下节「控制台认证架构」），与 `/v1` 的业务密钥鉴权互不相通。`admin.enabled` 默认关闭（最小暴露面）。
 - **写操作即时热更新路由**：渠道的增/改/删/启停落库后，`admin.Service` 立即 `router.UpdateChannels` 原子热替换，无需重启即生效（复用路由层「读多写少」的无锁热更新能力）。热更新失败仅记日志、不回滚写操作——由定时重载最终收敛。
 - **定时重载兜底多实例**：单进程内写操作能即时热更新自己的路由，但多实例部署时他实例感知不到。故 `database.enabled=true` 时起一个后台 goroutine 按 `channel_reload_interval` 定期从 DB 全量重载渠道。内存模式无共享存储，定时重载只会把本进程内存态原样写回，无意义，因此不启动。
+
+## 控制台认证架构
+
+管理控制台后端把网关从「裸 token 管理面」升级为「账号密码 + 会话」的多账户体系（`internal/account` + `internal/session` + `middleware/session_auth.go`）。核心取向：
+
+- **登录账户与计费实体解耦**：`accounts` 表（登录：用户名/bcrypt 哈希/角色/关联 external_id）与 `users` 表（计费：余额/额度）是两个概念。一个登录账户（`role=user`）通过 `external_id` 关联到一个计费实体；`role=admin` 账户管理系统但自身不必是计费主体。建 user 账户时**原子连带**创建计费实体（PG 走事务，失败整体回滚不留孤儿）——避免「有登录态却无计费账户」的裂缝。
+- **密码与哈希绝不外泄**：密码 bcrypt 存储（`HashPassword` 最短 8 位）。`Account` 领域视图**结构层就没有** `PasswordHash` 字段，哈希只活在不序列化的 `Credentials` 里——即便 handler 误把 `Account` 整个 JSON 返回也不会漏哈希。
+- **会话是服务端不透明令牌**：登录成功签发 crypto/rand 会话 ID，`SessionData`（账户 ID/用户名/角色/external_id）存 Redis 带 TTL；会话 ID 经 HttpOnly + SameSite=Strict Cookie 下发（生产 HTTPS 加 Secure），客户端 JS 读不到、跨站请求带不上。登出即删 Redis 记录（服务端失效，非仅清 Cookie）。「记住我」延长 TTL。
+- **鉴权 fail-closed**：`SessionAuth` 无有效会话即 401；`RequireRole` 取不到会话或角色不符即拒——任何环节缺失都是「拒绝」而非「放行」。`/admin` 双中间件顺序为先 `SessionAuth`（注入身份）后 `RequireRole(admin)`（校验角色），普通 user 与匿名都进不去。路由装配亦 fail-closed：依赖未注入则整组不挂，不会退化成无鉴权端点。
+- **越权硬约束**：`/me` 用户自助端点把资源归属绑定到会话身份——操作不属于自己的密钥返回 **404**（而非 403），连「该资源存在」都不泄露。
+- **首个管理员幂等播种**：`bootstrapAdmin` 在启动时按 `admin.bootstrap` 播种首个 admin——用户名已存在则跳过（不覆盖已有密码），密码为空则告警跳过（绝不建空密码账户），日志只记用户名。密码建议经 `LINAPI_ADMIN_BOOTSTRAP_PASSWORD` 环境变量注入，避免落配置文件。
 
 ## 可观测性
 

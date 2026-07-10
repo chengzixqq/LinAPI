@@ -154,9 +154,38 @@
 - **输出**：收尾按状态码选级别（5xx→Error、4xx→Warn、其余→Info），字段含 request_id/method/path/status/latency_ms/client_ip/身份（user_id/key_id）/model/channel/用量，缺失字段省略避免噪声。
 - **依赖方向**：`forwarder` 已依赖 `middleware`，故日志的 context 载体与 setter 定义在此包，由转发层回填（不反向依赖 forwarder）。
 
-### admin_auth.go
+### session_auth.go
 
-`AdminAuth(token, loopbackOnly)`：守护 `/admin` 分组，与 `/v1` 鉴权完全隔离。校验 `Authorization: Bearer <token>` 与配置的管理 token（常量时间比较防时序侧信道）；`loopbackOnly=true` 时额外要求来源是回环地址（127.0.0.1/::1），拒绝远程访问。token 为空视为未配置，直接拒绝所有请求（防误开放）。
+控制台会话鉴权（Task 14 起替换退役的 `admin_auth.go` 裸 token 方案）：
+
+- `SessionAuth(m *session.Manager)`：从 HttpOnly Cookie 取会话 ID，查 Redis 拿 `SessionData`（AccountID/Username/Role/ExternalID）注入 context；无 Cookie 或会话失效返回 401。
+- `RequireRole(role)`：在 `SessionAuth` 之后挂，校验会话角色。**fail-closed**——取不到会话或角色不符均返回 401/403（绝不因取不到会话而放行）。`/admin` 用 `SessionAuth` + `RequireRole(account.RoleAdmin)`。
+- `SessionFrom(c)`：handler 取当前登录身份，供 `/me` 把资源操作绑定到会话账户（越权硬约束的基础）。
+
+## internal/account —— 账户认证领域
+
+登录账户体系，与计费实体（`internal/store` 的 `users`）解耦：`accounts` 表存用户名 / bcrypt 密码哈希 / 角色 / 关联 `external_id`。
+
+### account.go（领域模型 + 接口）
+
+- `Account`：账户领域视图，**刻意无 `PasswordHash` 字段**——结构层杜绝哈希经 JSON 外泄；`Credentials`（不序列化）才含哈希，仅登录校验用。
+- 角色常量 `RoleAdmin` / `RoleUser`，`ValidRole` 把关（非法角色 `ErrInvalidRole`）。预留 `GroupName` / `RateMultiplier`（整数百分比倍率）存而未用。
+- `AccountStore` 接口：CreateAccount / CreateUserAccount（建 user 角色**原子连带**计费实体）/ GetByUsername / GetByID / List / SetEnabled / UpdatePassword。`SettingsStore` 接口：Get / Put（注册开关 + 新用户初始额度）。哨兵 `ErrNotFound` / `ErrConflict` / `ErrInvalidRole` / `ErrPasswordTooShort`。
+
+### password.go（bcrypt 封装）
+
+`HashPassword`（最短 8 位，短于则 `ErrPasswordTooShort`）/ `VerifyPassword`。绝不存明文。
+
+### memory.go / postgres.go（双实现）
+
+内存版用 map + 锁；PG 版 `CreateUserAccount` 走**事务**——同一事务内建 user 计费实体 + account 并回填 external_id，任一步失败整体回滚不留孤儿。唯一约束冲突（用户名）映射为 `ErrConflict`。
+
+## internal/session —— Redis 会话
+
+控制台登录态载体。`Manager`（`NewManager(rdb)`）用 crypto/rand 生成不透明会话 ID，`SessionData`（AccountID/Username/Role/ExternalID）JSON 存 Redis 带 TTL：
+
+- `Create(ctx, data, rememberMe)`：签发会话，「记住我」延长 TTL。
+- `Get(ctx, id)` / `Delete(ctx, id)`：查 / 删（登出即删，服务端失效）。
 
 ## internal/billing —— 计费结算
 
@@ -210,9 +239,11 @@
 
 ## internal/server —— HTTP 服务器
 
-- `New(cfg, Deps)`：构建 Gin engine（`gin.New()` + Recovery），注册路由，配置 `http.Server`。`Deps{Store, Redis, Billing, Forwarder, Admin}` 由 main 注入，便于测试替换（`Admin` 为 nil 则不挂管理端点）。
-- `registerRoutes`：全局挂 `RequestLogger`（结构化访问日志，跳过 `/healthz`、`/metrics`）+ `Metrics()` 中间件；`/healthz`（不走鉴权）；`/metrics`（Prometheus 暴露，不走鉴权，靠部署层网络隔离）；`/v1` 分组挂 Auth → RateLimit → Quota 三中间件，下辖 `/v1/chat/completions`（`Forwarder.Handler("openai")`）、`/v1/messages`（`Forwarder.Handler("anthropic")`）、`/v1/models`（`listModels`，从 `Forwarder.Models()` 聚合返回 OpenAI models 格式）。
-- `registerAdminRoutes`：仅当 `admin.enabled=true` 且注入了 Admin 服务时挂载 `/admin` 分组，受 `AdminAuth` 独立守护。下辖用户（创建/列表/详情/启停/充值）、密钥（挂用户下，创建/列表/启停）、渠道（全 CRUD）端点，`adminHandlers` 委托 `admin.Service`。
+- `New(cfg, Deps)`：构建 Gin engine（`gin.New()` + Recovery），注册路由，配置 `http.Server`。`Deps{Store, Redis, Billing, Forwarder, Admin, Account, Settings, Session, SecureCookie, Logger}` 由 main 注入，便于测试替换（`Admin`/`Account`/`Session` 等为 nil 则不挂对应端点，fail-closed）。
+- `registerRoutes`：全局挂 `RequestLogger`（结构化访问日志，跳过 `/healthz`、`/metrics`）+ `Metrics()` 中间件；`/healthz`（不走鉴权）；`/metrics`（Prometheus 暴露，不走鉴权，靠部署层网络隔离）；`/v1` 分组挂 Auth → RateLimit → Quota 三中间件，下辖 `/v1/chat/completions`（`Forwarder.Handler("openai")`）、`/v1/messages`（`Forwarder.Handler("anthropic")`）、`/v1/models`（`listModels`，从 `Forwarder.Models()` 聚合返回 OpenAI models 格式）；随后挂控制台路由 `registerAuthRoutes` / `registerMeRoutes` / `registerAdminRoutes`。
+- `registerAuthRoutes`：`/auth` 分组——register / login 不鉴权（未登录才能用），logout / me 挂 `SessionAuth`。register 受系统设置的注册开关约束。
+- `registerMeRoutes`：`/me` 分组挂 `SessionAuth`（任意登录角色），用户自助管理自己的密钥；资源归属绑定会话身份，操作他人 key 返回 404（越权硬约束）。
+- `registerAdminRoutes`：`/admin` 分组挂 `SessionAuth` + `RequireRole(account.RoleAdmin)`（先会话后角色）。下辖账户（`/admin/accounts` 增删改查启停 + 重置密码）、系统设置（`/admin/settings` 读写）、计费用户（创建/列表/详情/启停/充值）、密钥（挂用户下）、渠道（全 CRUD）。各 `register*Routes` 均有 nil 依赖守卫（`admin.enabled=false` 或依赖未注入时不挂路由、不 panic）。**裸 token 的 `AdminAuth` 已退役**。
 - **关键**：故意不设 `WriteTimeout`——SSE 流式响应可能持续数分钟，写超时会中途掐断长回复。
 - `Start` / `Shutdown` / `Addr`：生命周期。
 
@@ -250,8 +281,8 @@
 
 ## internal/config —— 配置
 
-Viper 加载，优先级：环境变量（前缀 `LINAPI_`，`.`→`_`）> 配置文件 > 默认值。配置文件缺失不报错。分七段：Server（port / mode）、Database（`enabled` 开关 + `dsn` + 连接池 + `auto_migrate` 启动建表）、Redis（addr / password / db）、Log（level / format）、Auth（`keys` 列表，驱动内存 Store，`database.enabled=true` 时退居开发用途）、Billing（`default_reserve` 默认预扣额 + 兜底单价 + `models` 计价表；含非零默认值，防止误配为 0 导致「免费」）、Admin（`enabled` 挂载 `/admin`、`token` 管理鉴权令牌〔enabled 但 token 空则启动报错，绝不允许无鉴权管理面〕、`loopback_only` 只收回环请求、`channel_reload_interval` 渠道定时热重载间隔秒〔默认 60，<=0 关闭〕）。
+Viper 加载，优先级：环境变量（前缀 `LINAPI_`，`.`→`_`）> 配置文件 > 默认值。配置文件缺失不报错。分七段：Server（port / mode）、Database（`enabled` 开关 + `dsn` + 连接池 + `auto_migrate` 启动建表）、Redis（addr / password / db）、Log（level / format）、Auth（`keys` 列表，驱动内存 Store，`database.enabled=true` 时退居开发用途）、Billing（`default_reserve` 默认预扣额 + 兜底单价 + `models` 计价表；含非零默认值，防止误配为 0 导致「免费」）、Admin（`enabled` 挂载控制台与 `/auth` `/me` `/admin` 端点、`bootstrap`〔首个管理员 username/password，幂等播种〕、`channel_reload_interval` 渠道定时热重载间隔秒〔默认 60，<=0 关闭〕）。**注**：Admin 段自控制台后端起已去除裸 `token` / `loopback_only`，改由「账号密码 + 会话 + admin 角色」鉴权。
 
 ## cmd/linapi —— 入口
 
-配置加载 → 初始化 Redis（`redisx.New`，失败退出）→ `buildDataLayer` 选数据层（`database.enabled=true`：建 `pgxpool` +（可选 `auto_migrate`）建表 + 装配 `PGStore`/`PGSink`/`admin.NewPGStore`，连不上致命退出；`=false`：内存 `MemoryStore` + `NopSink` + `admin.NewMemoryStore`）→ 加载渠道喂给 `routing.NewRouter`（PG 从 `channels` 表、否则 config 段）→ 构建计费门面（`buildBilling` 接收上一步选定的 Sink，持有 `Recorder` 供关闭时冲刷）→ 构建 `forwarder.New(router, billing, logger)` → 构建 `admin.NewService(adminStore, router, ...)` → `server.New(cfg, Deps{Store, Redis, Billing, Forwarder, Admin})` → `startChannelReload`（**仅 dbEnabled 且 `channel_reload_interval>0`** 才起后台 goroutine 定期 `ReloadChannels`；内存模式无共享存储，定时重载只会把本进程内存态原样写回，无意义）→ goroutine 启动 server → 监听 SIGINT/SIGTERM → 优雅关闭（30s 超时，`defer` 停 reload goroutine、`recorder.Close()` 冲刷残留用量日志、`pool.Close()` 关连接池）。空导入 `_ "linapi/internal/adapter/all"` 触发适配器注册。
+配置加载 → 初始化 Redis（`redisx.New`，失败退出）→ `buildDataLayer` 选数据层（`database.enabled=true`：建 `pgxpool` +（可选 `auto_migrate`）建表 + 装配 `PGStore`/`PGSink`/`admin.NewPGStore`/`account.NewPGStore`，连不上致命退出；`=false`：内存 `MemoryStore` + `NopSink` + `admin.NewMemoryStore` + `account.NewMemoryStore`；account store 同时充当 AccountStore 与 SettingsStore）→ 加载渠道喂给 `routing.NewRouter`（PG 从 `channels` 表、否则 config 段）→ 构建计费门面（`buildBilling` 接收上一步选定的 Sink，持有 `Recorder` 供关闭时冲刷）→ 构建 `forwarder.New(router, billing, logger)` → 构建 `admin.NewService(adminStore, router, ...)` → `session.NewManager(rdb)` 会话管理器 → `bootstrapAdmin`（配置了 `admin.bootstrap.username` 且不存在则幂等播种首个管理员；密码空则告警跳过，日志不记密码）→ `server.New(cfg, Deps{Store, Redis, Billing, Forwarder, Admin, Account, Settings, Session, SecureCookie, Logger})`（`SecureCookie = server.mode=="release"`）→ `startChannelReload`（**仅 dbEnabled 且 `channel_reload_interval>0`** 才起后台 goroutine 定期 `ReloadChannels`；内存模式无共享存储，定时重载只会把本进程内存态原样写回，无意义）→ goroutine 启动 server → 监听 SIGINT/SIGTERM → 优雅关闭（30s 超时，`defer` 停 reload goroutine、`recorder.Close()` 冲刷残留用量日志、`pool.Close()` 关连接池）。空导入 `_ "linapi/internal/adapter/all"` 触发适配器注册。

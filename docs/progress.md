@@ -2,6 +2,14 @@
 
 > 更新日期：2026-07-10
 
+## 当前协作状态（重要）
+
+> 2026-07-10 已完成三轮多智能体全面只读审查，累计确认 65 项（P0 7 / P1 34 / P2 24）。第三轮为安全专项，新增 14 项，覆盖免费额度套取、CSRF、认证滥用、SSE 慢读、SSRF、Redis/上游密钥保护、匿名资源耗尽和依赖公告。审查快照 `0736eb1` 已在 server 层注册 `/auth`、`/me`、`/admin`，但被 Git 忽略的 main 尚未注入账户/设置/会话依赖，标准二进制仍不会挂载这些路由；相关安全项因此继续标为条件性。完整证据、稳定问题 ID、修复批次和验收矩阵见 [`reviews/2026-07-10-comprehensive-readonly-audit.md`](reviews/2026-07-10-comprehensive-readonly-audit.md)。
+>
+> 当前状态：**只记录，暂不修复**。需等待 Claude 当前工作完成、合并并重新建立测试基线后，再由 AI 按 `AUD-*` ID 认领。审查发现不改变下方历史“已完成功能”的实现记录，但在 P0/P1 关闭前，不应把项目视为已满足真实商用计费上线条件。
+>
+> Claude 已提交 server 会话路由，但端到端 main 装配尚未完成，且 `cmd/linapi/main.go` 仍受 `AUD-P1-09` 的忽略规则影响。main 完成装配后须优先复验审查文档第 17～21 节的条件性安全项。
+
 ## 七步计划
 
 | # | 模块 | 状态 |
@@ -114,11 +122,24 @@
   - `internal/server`：admin handler HTTP 全链路（无令牌 401、用户生命周期、密钥明文仅回显一次且列表不含明文、渠道上游 api_key 脱敏、非法 format 400、删除 204/再删 404）。
   - `internal/middleware`：logger 中间件行为（生成/复用 request_id、响应头、skip 路径、字段回填、级别映射、无中间件不 panic）。
 
+### 第 11 步 · 统一账户认证体系（控制台后端）
+把管理面从「裸 token」升级为「账号密码 + 会话」的完整控制台后端，账户体系与计费实体解耦。分 16 个子任务经子代理驱动开发（每任务 TDD + 独立复核）落地。
+- **账户领域**（`internal/account`）：登录账户（`accounts` 表：用户名/bcrypt 密码哈希/角色/关联 external_id）与计费实体（`users` 表）职责分离。`AccountStore` + `SettingsStore` 接口，内存与 PostgreSQL 双实现。建 user 账户**原子连带**创建计费实体并回填 external_id（PG 走事务，任一步失败整体回滚不留孤儿）。`Account` 领域视图刻意无 `PasswordHash` 字段（结构层杜绝哈希外泄），仅 `Credentials`（不序列化）含哈希供登录校验。角色仅 `admin`/`user`（`ValidRole` 把关）。预留 `group_name` / `rate_multiplier`（整数百分比倍率）存而未用。
+- **密码哈希**（`internal/account`）：bcrypt 封装，`HashPassword`（最短 8 位，短于则 `ErrPasswordTooShort`）/ `VerifyPassword`。绝不存明文。
+- **会话管理**（`internal/session`）：Redis 会话，`Manager` 生成不透明会话 ID（crypto/rand），`SessionData`（AccountID/Username/Role/ExternalID）JSON 存 Redis 带 TTL；「记住我」延长 TTL。登出即删。
+- **鉴权中间件**（`internal/middleware/session_auth.go`）：`SessionAuth` 从 HttpOnly Cookie 取会话 ID 查 Redis，注入 `SessionData` 到 context（无会话 401）；`RequireRole` 校验角色（取不到会话或角色不符均拒，**fail-closed**）。Cookie 属性 HttpOnly + SameSite=Strict + 可选 Secure（生产 HTTPS）。
+- **控制台端点**：`/auth`（register 受注册开关约束 / login / logout / me）、`/me`（用户自助：改自己的密钥，key 归属绑定会话身份，**越权硬约束**——操作他人 key 返回 404 而非 403，不泄存在性）、`/admin/accounts`（账户增删改查启停 + 重置密码）、`/admin/settings`（注册开关 + 新用户初始额度）。
+- **鉴权收口**：`/admin` 由裸 token 改为 `SessionAuth` + `RequireRole(admin)`（顺序：先会话后角色），退役 `AdminAuth` 中间件（全树无残留）；`/me` 挂 `SessionAuth`（任意登录角色）；`/auth` 的 register/login 不鉴权。各 `register*Routes` 有 nil 依赖守卫（依赖装配不全时不挂路由，fail-closed 而非请求期 panic）。
+- **启动播种**（`cmd/linapi`）：`bootstrapAdmin` 在配置了 `admin.bootstrap.username` 且该用户名不存在时播种首个管理员（幂等，不覆盖已有；密码为空则告警跳过，绝不建空密码账户；日志只记 username 不记密码）。密码建议经 `LINAPI_ADMIN_BOOTSTRAP_PASSWORD` 环境变量注入。
+- config `admin` 段改造：去 `token` / `loopback_only`，加 `bootstrap`（username/password）；`SecureCookie = (server.mode == "release")`。schema 双写（`db/schema.sql` + `internal/db/schema.sql`）新增 `accounts` / `settings` 表 + `users.rate_multiplier` 列。
+- **附带修复**：`.gitignore` 裸 `linapi` 规则改 `/linapi` 锚定仓库根——原规则误伤 `cmd/linapi/` 源码目录，导致入口 `main.go` 长期未被 Git 跟踪（对应审查文档 `AUD-P1-09`）。
+- 测试覆盖：account（密码哈希、内存/PG 双实现 CRUD、建 user 连带计费实体、角色校验）、session（会话往返/TTL/删除）、server（/auth、/me 越权硬约束、/admin 账户/设置 HTTP 全链路、密码哈希不外泄、角色分流）、middleware（SessionAuth/RequireRole fail-closed）；全过 `-race`。
+
 ## 测试现状
 
-- 111 个测试函数，分布在 28 个文件。
+- 142 个测试函数，分布在 35 个文件。
 - 全部通过，且 `CGO_ENABLED=1 go test -race ./...` 干净（gcc 已装好，路径见 CLAUDE.md）。
-- billing / account 用 `miniredis`（内嵌 Lua）真实执行原子脚本；PGStore / PGSink 用 fake Querier 单测（不依赖真实 PG）；转发层用 `httptest` 起模拟上游 + `miniredis`，走鉴权→额度→转发全链路集成测试（含流式与同格式直通保真）；管理面（admin/server）用内存 Store + `httptest` 走 HTTP 全链路；访问日志中间件用 `bytes.Buffer` 捕获 JSON 日志断言字段。
+- billing / account / session 用 `miniredis`（内嵌 Lua）真实执行原子脚本；PGStore / PGSink / account.PGStore 用 fake Querier 单测（不依赖真实 PG）；转发层用 `httptest` 起模拟上游 + `miniredis`，走鉴权→额度→转发全链路集成测试（含流式与同格式直通保真）；管理面与控制台（admin/account/server）用内存 Store + `httptest` 走 HTTP 全链路；访问日志中间件用 `bytes.Buffer` 捕获 JSON 日志断言字段。
 
 ## 端到端现状
 
@@ -128,6 +149,7 @@
 
 当前实现已可用且具备基本运维能力（管理面 / 指标 / 热重载 / 直通优化已落地）。以下为仍可继续的增强：
 - **链路追踪**：结构化访问日志（`RequestLogger`，request_id 贯通）+ Prometheus 指标已铺开，但尚无分布式追踪（OpenTelemetry span 传播）。
-- **管理面鉴权强化**：当前为单一静态 token；可扩展为多管理员账号 / RBAC / 审计日志。
+- **控制台前端**：本轮完成的是控制台**后端**（`/auth` `/me` `/admin`）；登录页 / 管理控制台 UI / 用户面板属另一份前端计划（Plan 2），尚未实现。
+- **认证体系可继续增强**：账户认证（账号密码 + 会话 + admin/user 角色）已落地；仍可扩展的有——审计日志、更细粒度 RBAC（当前仅 admin/user 两级）、`rate_multiplier` / `group_name` 预留字段的实际启用、CSRF 防护与匿名注册限流（见审查文档条件性安全项）。
 - **更多供应商适配器**：当前 openai / anthropic 两家；Gemini 等可按注册机制扩展。
 - **sqlc 为手写同构产物**：`internal/db/` 是按 sqlc 约定手写的等价代码（环境无法联网装 sqlc）；能装 sqlc 后 `sqlc generate` 可原样覆盖。改表结构时记得同步根 `db/schema.sql` 与 `internal/db/schema.sql` 两份。

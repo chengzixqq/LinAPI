@@ -35,12 +35,16 @@ auth:
       enabled: true
       initial_balance: 1000000       # 初始额度，最小计费单位
 
-# 管理面（用户/密钥/渠道 CRUD）。与业务 /v1 端点鉴权隔离。
-# 默认关闭；开启后 /admin/* 端点需用独立 token 鉴权（绝不与业务 API Key 共用）。
+# 管理面与控制台。改为「账号密码 + 会话」鉴权，不再用裸 token。
+# 默认关闭；enabled=true 时挂载 /auth（注册/登录/登出）、/me（用户自助）、/admin（管理端点）。
+# /admin 需登录会话且角色为 admin；/me 需登录会话（任意角色）。
 admin:
-  enabled: false                   # true 时挂载 /admin/* 管理端点
-  token: ""                        # 管理令牌：客户端用 Authorization: Bearer <token> 访问；enabled=true 时不可为空
-  loopback_only: false             # true 时仅接受来自 127.0.0.1/::1 的管理请求，与 token 叠加双重防线
+  enabled: false                   # true 时挂载控制台与 /auth /admin /me 端点
+  # 首个管理员播种：仅当该用户名不存在时创建（幂等）。密码建议用环境变量注入：
+  #   LINAPI_ADMIN_BOOTSTRAP_PASSWORD=xxxx
+  bootstrap:
+    username: ""                   # 为空则不播种
+    password: ""                   # 为空则不播种并告警（绝不建空密码账户）
   channel_reload_interval: 60      # 渠道定时热重载间隔（秒），<=0 关闭；仅 database.enabled=true 时生效
 
 # 上游渠道（过渡期配置来源）。database.enabled=true 时渠道改由 channels 表管理，
