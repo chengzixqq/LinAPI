@@ -123,7 +123,9 @@ func (s *Server) registerAuthRoutes() {
 
 // registerMeRoutes 挂载 /me 分组（用户自助）。需登录（任意角色）。
 func (s *Server) registerMeRoutes() {
-	if !s.cfg.Admin.Enabled || s.deps.Account == nil || s.deps.Session == nil || s.deps.Admin == nil {
+	// 守卫对齐 handler 实际依赖：newMeHandlers 用 Admin+Store，分组挂 SessionAuth 用 Session。
+	// 缺任一则整组不挂（fail-closed），绝不挂出裸奔或请求期 nil-panic 的端点。
+	if !s.cfg.Admin.Enabled || s.deps.Admin == nil || s.deps.Store == nil || s.deps.Session == nil {
 		return
 	}
 	h := newMeHandlers(s.deps.Admin, s.deps.Store)
