@@ -99,37 +99,16 @@ func (s *Server) registerRoutes() {
 	s.registerAdminRoutes()
 }
 
-// registerAdminRoutes 挂载管理面 /admin 分组。仅当 admin.enabled=true 且注入了
-// Admin 服务时生效；受独立 AdminAuth（token + 可选回环限制）保护，与 /v1 鉴权隔离。
+// registerAdminRoutes 挂载管理面 /admin 分组。
+//
+// TODO(Task 14): 本函数在 Task 9 移除 Admin.Token/LoopbackOnly 后处于过渡态。
+// 旧的 AdminAuth（裸 token）已不再适用；Task 14 将把 /admin 重新挂到
+// SessionAuth + RequireRole("admin") 之下（与 /auth、/me 一致的会话鉴权）。
+// 过渡期间暂不挂载 /admin 路由——绝不以「无鉴权」形式暴露管理端点。
+// 注意：既有 admin_handlers_test.go 自建 gin 引擎测试各 handler，不依赖本函数。
 func (s *Server) registerAdminRoutes() {
-	if !s.cfg.Admin.Enabled || s.deps.Admin == nil {
-		return
-	}
-
-	h := &adminHandlers{svc: s.deps.Admin}
-	g := s.engine.Group("/admin")
-	g.Use(middleware.AdminAuth(s.cfg.Admin.Token, s.cfg.Admin.LoopbackOnly))
-	{
-		// 用户
-		g.POST("/users", h.createUser)
-		g.GET("/users", h.listUsers)
-		g.GET("/users/:id", h.getUser)
-		g.PATCH("/users/:id/enabled", h.setUserEnabled)
-		g.POST("/users/:id/balance", h.addBalance)
-
-		// 密钥（挂在用户下）
-		g.POST("/users/:id/keys", h.createKey)
-		g.GET("/users/:id/keys", h.listKeys)
-		g.PATCH("/keys/:keyid/enabled", h.setKeyEnabled)
-
-		// 渠道
-		g.POST("/channels", h.createChannel)
-		g.GET("/channels", h.listChannels)
-		g.GET("/channels/:id", h.getChannel)
-		g.PUT("/channels/:id", h.updateChannel)
-		g.PATCH("/channels/:id/enabled", h.setChannelEnabled)
-		g.DELETE("/channels/:id", h.deleteChannel)
-	}
+	// 过渡期空实现：Task 14 恢复挂载（改用会话鉴权）。
+	_ = s.deps.Admin
 }
 
 func placeholder(c *gin.Context) {
