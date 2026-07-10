@@ -81,20 +81,24 @@ type KeyConfig struct {
 	InitialBalance  int64    `mapstructure:"initial_balance"` // 最小计费单位
 }
 
-// AdminConfig 是管理面（用户/密钥/渠道 CRUD）的配置。
-// 管理端点与业务 /v1 端点鉴权隔离：需独立的 admin token，且可选仅允许回环地址访问。
+// AdminConfig 是管理面与控制台的配置。
+// 控制台鉴权改为「账号密码 + 会话」，不再用裸 token；本段仅保留挂载开关、
+// 首个管理员播种（bootstrap）与渠道定时热重载间隔。
 type AdminConfig struct {
-	// Enabled 为 true 时挂载 /admin/* 管理端点；默认关闭（最小暴露面）。
+	// Enabled 为 true 时挂载控制台（/console）与认证端点（/auth /admin /me）；默认关闭。
 	Enabled bool `mapstructure:"enabled"`
-	// Token 是管理端点的鉴权令牌（Authorization: Bearer <token>）。
-	// Enabled=true 但 Token 为空时启动报错——绝不允许无鉴权的管理面。
-	Token string `mapstructure:"token"`
-	// LoopbackOnly 为 true 时只接受来自回环地址（127.0.0.1/::1）的管理请求，
-	// 与 token 叠加形成双重防线。
-	LoopbackOnly bool `mapstructure:"loopback_only"`
-	// ChannelReloadInterval 是渠道定时热重载的间隔（秒）。
-	// <=0 表示关闭定时重载（仅管理写操作即时热更新）。仅 database.enabled=true 时生效。
+	// Bootstrap 是首个管理员账户的播种配置（仅当该用户名不存在时创建）。
+	Bootstrap BootstrapConfig `mapstructure:"bootstrap"`
+	// ChannelReloadInterval 是渠道定时热重载的间隔（秒）。<=0 关闭。仅 database.enabled=true 生效。
 	ChannelReloadInterval int `mapstructure:"channel_reload_interval"`
+}
+
+// BootstrapConfig 描述首个管理员账户的播种参数。
+type BootstrapConfig struct {
+	// Username 为空时不播种。
+	Username string `mapstructure:"username"`
+	// Password 建议用环境变量注入（LINAPI_ADMIN_BOOTSTRAP_PASSWORD）。为空时不播种并告警。
+	Password string `mapstructure:"password"`
 }
 
 // BillingConfig 是计费模块配置。单价单位：最小计费单位 / 每 100 万 token。
@@ -162,11 +166,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "json")
 
-	// 管理面默认关闭，需显式开启并配置 token。回环限制默认关闭；
+	// 管理面/控制台默认关闭，需显式开启。bootstrap 默认空（不播种）。
 	// 渠道定时热重载默认 60s（database.enabled=true 时生效，<=0 关闭）。
 	v.SetDefault("admin.enabled", false)
-	v.SetDefault("admin.token", "")
-	v.SetDefault("admin.loopback_only", false)
+	v.SetDefault("admin.bootstrap.username", "")
+	v.SetDefault("admin.bootstrap.password", "")
 	v.SetDefault("admin.channel_reload_interval", 60)
 
 	// 计费默认值：默认预扣额与兜底单价。单价 = 最小计费单位 / 每 100 万 token。
