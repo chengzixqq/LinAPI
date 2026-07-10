@@ -6,42 +6,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const insertUsageLog = `-- name: InsertUsageLog :exec
-INSERT INTO usage_logs (
-    request_id, user_id, key_id, model, channel, input_tokens, output_tokens, cost, created_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-ON CONFLICT (request_id) DO NOTHING
-`
-
-// InsertUsageLogParams 是 InsertUsageLog 的入参。
-type InsertUsageLogParams struct {
-	RequestID    string             `json:"request_id"`
-	UserID       string             `json:"user_id"`
-	KeyID        string             `json:"key_id"`
-	Model        string             `json:"model"`
-	Channel      string             `json:"channel"`
-	InputTokens  int32              `json:"input_tokens"`
-	OutputTokens int32              `json:"output_tokens"`
-	Cost         int64              `json:"cost"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-}
-
-// InsertUsageLog 落库一条用量日志。ON CONFLICT (request_id) 保证按请求幂等。
-func (q *Queries) InsertUsageLog(ctx context.Context, arg InsertUsageLogParams) error {
-	_, err := q.db.Exec(ctx, insertUsageLog,
-		arg.RequestID,
-		arg.UserID,
-		arg.KeyID,
-		arg.Model,
-		arg.Channel,
-		arg.InputTokens,
-		arg.OutputTokens,
-		arg.Cost,
-		arg.CreatedAt,
-	)
-	return err
-}
-
 const sumCostByUser = `-- name: SumCostByUser :one
 SELECT COALESCE(SUM(cost), 0)::BIGINT AS total_cost
 FROM usage_logs

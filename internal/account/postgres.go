@@ -68,9 +68,9 @@ func (s *PGStore) CreateUserAccount(ctx context.Context, username, passwordHash 
 	return accountFromDB(acc), nil
 }
 
-// CreateAccount 直接建账户（bootstrap 建 admin）。
+// CreateAccount 直接建管理员账户（bootstrap 用）；user 必须走 CreateUserAccount。
 func (s *PGStore) CreateAccount(ctx context.Context, in CreateAccountInput) (Account, error) {
-	if !ValidRole(in.Role) {
+	if in.Role != RoleAdmin || in.ExternalID != "" {
 		return Account{}, ErrInvalidRole
 	}
 	var ext pgtype.Text
@@ -145,25 +145,21 @@ func (s *PGStore) UpdatePassword(ctx context.Context, id int64, passwordHash str
 }
 
 func (s *PGStore) Get(ctx context.Context) (Settings, error) {
-	out := Settings{RegistrationEnabled: DefaultRegistrationEnabled, NewUserInitialBalance: DefaultNewUserInitialBalance}
-	if v, err := s.q.GetSetting(ctx, KeyRegistrationEnabled); err == nil {
-		out.RegistrationEnabled = parseBool(v.Value, DefaultRegistrationEnabled)
-	} else if !errors.Is(err, pgx.ErrNoRows) {
+	row, err := s.q.GetSettingsSnapshot(ctx)
+	if err != nil {
 		return Settings{}, err
 	}
-	if v, err := s.q.GetSetting(ctx, KeyNewUserInitialBalance); err == nil {
-		out.NewUserInitialBalance = parseInt64(v.Value, DefaultNewUserInitialBalance)
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return Settings{}, err
-	}
-	return out, nil
+	return Settings{
+		RegistrationEnabled:   parseBool(row.RegistrationEnabled, DefaultRegistrationEnabled),
+		NewUserInitialBalance: parseInt64(row.NewUserInitialBalance, DefaultNewUserInitialBalance),
+	}, nil
 }
 
 func (s *PGStore) Put(ctx context.Context, st Settings) error {
-	if err := s.q.UpsertSetting(ctx, db.UpsertSettingParams{Key: KeyRegistrationEnabled, Value: formatBool(st.RegistrationEnabled)}); err != nil {
-		return err
-	}
-	return s.q.UpsertSetting(ctx, db.UpsertSettingParams{Key: KeyNewUserInitialBalance, Value: formatInt64(st.NewUserInitialBalance)})
+	return s.q.UpsertSettingsSnapshot(ctx, db.UpsertSettingsSnapshotParams{
+		RegistrationEnabled:   formatBool(st.RegistrationEnabled),
+		NewUserInitialBalance: formatInt64(st.NewUserInitialBalance),
+	})
 }
 
 // accountFromDB 把 db.Account 转为领域视图（丢弃 password_hash）。

@@ -1,19 +1,24 @@
 # 开发进度
 
-> 更新日期：2026-07-10
+> 更新日期：2026-07-11
 
 ## 当前协作状态（重要）
 
 > 2026-07-10 已完成三轮多智能体全面只读审查，累计确认 65 项（P0 7 / P1 34 / P2 24）。第三轮为安全专项，新增 14 项，覆盖免费额度套取、CSRF、认证滥用、SSE 慢读、SSRF、Redis/上游密钥保护、匿名资源耗尽和依赖公告。完整证据、稳定问题 ID、修复批次和验收矩阵见 [`reviews/2026-07-10-comprehensive-readonly-audit.md`](reviews/2026-07-10-comprehensive-readonly-audit.md)。
 >
-> **控制台安全批次已修复（2026-07-10，master 分支）**：先修控制台安全 + 即时止损，再做前端（Plan 2）——因为开前端需 `admin.enabled=true`，会点亮整个控制台攻击面。本轮已闭合：
+> **控制台与协议安全批次（截至 2026-07-11）**：先修控制台安全 + 即时止损，再做前端（Plan 2）。当前工作区已闭合或收敛：
 > - **批次 A（即时止损）**：AUD-P1-01（`/models` 误扣押金，拆分 /v1 中间件）、AUD-P1-03（余额不足 key 补 TTL）、AUD-P1-09（`.gitignore` 误伤 `cmd/linapi/`，已由 010b851 修）。
-> - **批次 G（控制台安全）**：AUD-P0-07（注册恒不送额度 + putSettings 拒绝正初始余额）、AUD-P1-26（CSRF 双重提交 token + 强制 JSON + Origin 校验）、AUD-P1-27（登录注册 IP 令牌桶限速 + bcrypt 并发信号量）、AUD-P1-28（自助 Key 每账户 ≤50 把、限速 ∈[1,5000]）、AUD-P1-29（可靠登出：删除失败回 503 不谎报）；P2-21 用户名枚举随 login/register 恒定工作量一并闭合。
-> - **批次 E（部分）**：AUD-P1-17（账户加 `session_version`，禁用/改密递增使旧会话立即失效；`SessionAuthWithVersion` 在 /auth、/me、/admin 三处接线）。
+> - **批次 G（控制台安全）**：P0-07、P1-26、P1-27～29、P2-21/P2-23 已落地。登录/注册在 bcrypt 前有来源 IP + 登录标识摘要预算，`TryAcquire` 满载 503；Redis Lua 原子限制每账户活跃会话。自助 Key 强制 1..5000、存储层原子限制 50 把，并叠账户总桶；注册冲突统一成功响应，不泄用户名存在性。
+> - **批次 E（账户/存储契约）**：P1-17 session_version、P1-18 Settings 单 SQL 快照、P2-08/09/11/12/13/18/19/20 已按内存/PG 一致性方向修复；版本化 schema 见 P2-10 的上线验收边界。
+> - **批次 C/D/F/H（路由、协议、运行时与网络）**：breaker permit generation + neutral cancel、联合字段/developer/tool RawMessage、n=1 与异常 choices 显式拒绝、HTTP/SSE 超时/大小限制、SSRF 拨号策略、Redis TLS/ACL、渠道 key 加密、鉴权前闸门、metrics 防护和 go-redis v9.7.3 均已落地。
 >
-> main 端到端装配已完成（`cmd/linapi/main.go` 注入 Account/Settings/Session + `bootstrapAdmin` 播种首个管理员），标准二进制在 `admin.enabled=true` 下会挂载 `/auth`、`/me`、`/admin` 并受上述防护覆盖。全量 `go build`、`go vet`、`CGO_ENABLED=1 go test -race ./...` 全绿。
+> main 端到端装配已完成（`cmd/linapi/main.go` 注入 Account/Settings/Session + `bootstrapAdmin` 播种首个管理员），标准二进制在 `admin.enabled=true` 下会挂载 `/auth`、`/me`、`/admin` 并受上述防护覆盖。本轮新增回归与最终全量验证结果见下方“测试现状”。
 >
-> **仍待处理**：批次 B（计费账本 AUD-P0-01～06 及相关 P1）需先做设计评审，本轮未动——在这些 P0/P1 关闭前，不应把项目视为已满足真实商用计费上线条件。批次 C/D/F/H 及其余 P2 亦待后续认领。逐项状态见审查文档第 10 节跟踪表。
+> **批次 B（计费一致性）P0 已完成代码修复**：`users.balance` 成为唯一权威余额；新增 reservation 状态机和只追加 ledger；Redis 退出资金路径。Forwarder 按最坏成本预授权，release 为每个启用的 OpenAI `channel/upstream_model` 强制配置 `max_tokens|max_completion_tokens`，候选确定后只写策略字段，再 MarkInFlight/send。3xx、网络错误、408、5xx 停止重放并保留预授权，明确未消费的 4xx 才 ReleaseAttempt。usage 缺失、部分或 total/cache 冲突均保留整笔预授权。Recover 只自动完成已持久化的 `consumed_unsettled`，并回收过期 reserved/告警过期 in_flight；`RecordConsumption` 持续失败时 usage 仍无持久待办，故 P1-12 只算部分修复。
+>
+> **仍未闭合的代码/协议窗口**：P1-12 中 `RecordConsumption` 持续失败仍没有独立持久 outbox，reservation 保持冻结转人工对账；P2-03 中 OpenAI→Anthropic 的迟到 input usage 因目标协议无等价位置无法在线表达，账本保留预授权而不伪造精确 usage。
+>
+> **上线条件仍未完成**：部署前必须冻结旧资金写入，人工对账 PostgreSQL、Redis 与供应商账单；在真实 PostgreSQL 演练版本化迁移、并发预授权、提交结果未知、崩溃恢复和重放；在真实 Redis TLS/ACL 环境验证连接与证书。数据库渠道 key 迁移需维护窗一次开启 `migrate_plaintext`，成功后关闭并轮换历史供应商 key。完成这些条件前只能称代码级修复。
 
 ## 七步计划
 
@@ -23,8 +28,8 @@
 | 2 | 内部规范数据模型 + 适配器接口与注册表 | ✅ 完成 |
 | 3 | OpenAI + Claude 适配器（请求/响应/流式转换） | ✅ 完成 |
 | 4 | 路由 / 负载均衡引擎（渠道组 / 优先级 / 权重 / 故障转移 / 熔断） | ✅ 完成 |
-| 5 | 鉴权 + 限流 + 额度中间件（Redis） | ✅ 完成 |
-| 6 | 计费结算（预扣费 + 异步落库） | ✅ 完成 |
+| 5 | 鉴权 + 限流中间件（Redis 仅作非资金基础设施） | ✅ 完成 |
+| 6 | 计费结算（PostgreSQL 权威账本 + 最坏成本预授权） | ✅ 完成（代码级） |
 | 7 | 数据库 schema + sqlc 集成 | ✅ 完成 |
 
 > 七步全部完成。**转发 handler 已接线**（把适配器 + 路由 + 熔断 + 计费串起来真正发 HTTP），见下「第 8 步 · 转发层」。至此请求可端到端跑通。
@@ -32,11 +37,12 @@
 ## 已完成的细节
 
 ### 第 1 步 · 骨架
-- Viper 配置（环境变量覆盖）、Gin server、优雅关闭、`/healthz`。
+- Viper 配置（环境变量覆盖）、Gin server、优雅关闭；`/healthz`/`/livez` 提供进程存活探针，`/readyz` 以 2 秒预算检查 PostgreSQL/Redis 强依赖。
+- 配置文件是可选输入：路径不存在时使用环境变量与默认值；其他读取/解析错误 fail-fast（AUD-P2-07 已修）。
 - `config.example.yaml` 提供配置模板。
 
 ### 第 2 步 · 规范模型 + 适配器框架
-- `internal/canonical`：请求/响应/流式事件的完整数据模型（各家格式的超集）。
+- `internal/canonical`：支持有序 system/developer、文本/图片/thinking/tool block，工具参数保存原始 JSON 并用 `UseNumber` 防大整数损失；项目明确只支持 OpenAI n=1，异常多 choices 不静默截断。
 - `internal/adapter`：`Adapter` 接口 + 全局注册表（`init()` 自动注册）。
 
 ### 第 3 步 · OpenAI + Claude 适配器
@@ -45,79 +51,77 @@
 
 ### 第 4 步 · 路由引擎
 - 优先级分组 + 组内加权随机不放回抽样。
-- 三态熔断器（Closed/Open/HalfOpen），`Ready()` / `Allow()` 分离。
+- 三态熔断器（Closed/Open/HalfOpen），`Ready()` 无副作用；`Allow()` 返回 generation permit，以 success/failure/neutral 一次性结束，旧代际迟到结果无效。
 - `atomic.Pointer` 无锁读 + 渠道热更新（保留熔断状态）。
 - 已通过 `go test -race`（数据竞争检测干净）。
 
-### 第 5 步 · 鉴权 + 限流 + 额度中间件
-- `internal/redisx`：共享 Redis 客户端封装，从 config 构建 + 启动期 PING 连通性探测。
+### 第 5 步 · 鉴权 + 限流中间件
+- `internal/redisx`：go-redis v9.7.3，支持 ACL、TLS CA/mTLS 与启动 PING；release 阻止未显式豁免的远程明文 Redis。
 - `internal/store`：`Store` 接口（`ResolveKey` / `Balance`）+ 配置驱动的 `MemoryStore` 内存实现，
   第 7 步用 sqlc/PostgreSQL 实现同一接口替换，中间件层零改动。
 - `internal/middleware`：
-  - **Auth**：兼容 `Authorization: Bearer` 与 `x-api-key` 两种头，解析身份注入 `gin.Context`。
-  - **RateLimit**：Redis Lua 原子令牌桶（单次往返、惰性补充），按 KeyID 维度，Redis 故障时 fail-open。
-  - **Quota**：请求前余额闸门（余额 <=0 返回 402），预扣费钩子留给第 6 步。
-- 三者按 Auth → RateLimit → Quota 顺序挂在 `/v1` 分组；`server.New` 改为接收 `Deps{Store, Redis}` 注入。
-- config 新增 `auth.keys` 段驱动 MemoryStore；对外错误统一 OpenAI 风格结构。
-- 测试覆盖：store（身份/模型/余额/副本隔离）、auth（双头/401 路径）、quota（余额闸门 200/402）。
+- **Auth**：兼容 Bearer / `x-api-key`，长度上限 512；查库前有来源 IP 桶和非阻塞并发闸门。
+- **RateLimit**：Redis `TIME` + Lua 原子桶，先账户总预算再单 Key 预算。
+- `/v1` 在所有早退中间件前注入协议上下文，OpenAI/Anthropic 的 401/413/429/panic 500 使用各自 error schema。生成端点由 Forwarder 预授权，`/v1/models` 不触碰资金。
+- Server 设置 read/header/idle/body/header 大小边界；`/livez` 与 `/readyz` 分离，metrics 使用 token + max-inflight + timeout。
+- 测试覆盖：store（身份/模型/余额/副本隔离）、auth（双头/401 路径）、rate limit 与生成端点 402 路径。
 
-### 第 6 步 · 计费结算（预扣费 + 异步落库）
-- `internal/billing` 新增，四个文件各司其职：
-  - **pricing.go**：`Pricing` 计价表（模型单价 + 兜底价），单位「最小计费单位 / 每 100 万 token」。`Cost` 除法**向上取整**，避免整数截断少收费。
-  - **account.go**：`Account` 是余额的 Redis 热副本。`adjustScript` 一段 Lua 原子完成「惰性 seed + 校验下限 + 调整」——`Reserve`（预扣，下限 0，余额不足即拒）与 `Settle`（退差/补收，下限 `settleFloor`，永远放行，允许必要透支）共用。INCRBY 走原字符串保证 64 位整数精确。
-  - **recorder.go**：`Sink` 落库接口 + `NopSink`（当前）；`Recorder` 带缓冲 channel + 后台 goroutine 批量写（攒够 `BatchSize` 或到 `FlushInterval` 冲刷），**队列满退化为同步写**保证不丢账单，`Close`（`sync.Once`）冲刷残留。
-  - **billing.go**：`Billing` 门面聚合三者，对转发层提供 `Reserve`（预扣押金→句柄 `Reservation`）/ `Settle`（按真实用量退差 + 记用量日志）/ `Refund`（转发全败全额退押金）。
-- **预扣时机**：`Quota` 中间件升级为真正的预扣费闸门——读冷源余额作 seed，`billing.Reserve` 原子预扣 `default_reserve`，成功则把 `Reservation` 注入 context；余额不足 402。此时请求体未解析，`model` 留空，转发层解析后用 `middleware.SetReservationModel` 回填供计价。
-- config 新增 `billing` 段：`default_reserve` + 兜底单价 + `models` 计价表；含非零默认值防「误配为 0 免费」。
-- main 构建计费门面并持有 `Recorder`，优雅关闭时 `defer recorder.Close()` 冲刷用量日志。
-- 测试覆盖：pricing（取整/兜底/nil）、account（seed/预扣/不足/透支/**并发 100 goroutine 不超卖**）、recorder（批量/定时/满兜底/幂等 Close）、billing（预扣→结算往返/不足/退款）；用 `miniredis` 真实执行 Lua 脚本，全过 `-race`。
+### 第 6 步 · 计费结算（持久预授权 + 幂等状态机）
+- `internal/billing` 以 `Ledger` 为资金边界：生产使用 `PostgresLedger`，开发/测试使用 `MemoryLedger`。已删除 Redis `Account`、异步 `Recorder`/`PGSink` 与 `Quota` 资金路径。
+- `Pricing` 为普通输入、输出、cache creation、cache read 分别配置单价，并配置输入/输出上界。预授权的输入维度按普通输入与两种缓存输入中的最高费率冻结；所有乘加与向上取整做溢出检查。release 要求每个已发布模型都有四项非零价格及显式输入/输出 token 上限。
+- Forwarder 先解析请求、校验模型权限、规范化 `max_tokens`，再按“最大可计费输入 + 强制输出上限”计算最坏成本并调用 `Billing.Reserve`。PostgreSQL 用条件 `UPDATE` 在同一事务内扣减 `users.balance`，余额不足在上游 I/O 前返回 402，并发请求无法超卖。
+- reservation 状态为 `reserved → in_flight(channel) → consumed_unsettled → settled`。只有明确 4xx 能证明未生成时，attempt 才可 `in_flight → reserved`；随后可安全换渠道或退款。终态退款仅允许 `reserved → refunded`。
+- `RecordConsumption` 先持久化上游已消费事实（瞬时错误有限重试）；`Finalize` 在同一事务内退差、追加资金流水、写最终 `usage_logs`。网络错误、408、5xx 保留 `in_flight`，不得跨渠道重放或退款。MarkInFlight 后尚未执行网络发送，因此标记失败时先幂等 ReleaseAttempt；释放也失败才保守冻结。
+- canonical usage 显式记录各字段是否已知。完整分项按四项费率计价；OpenAI cached tokens 从普通输入拆出按 cache read 计价。只有 total 时按所有价格中的最高值保守收费；total 小于缓存分项或与已知分项合计冲突时保留整笔预授权并标记 `estimated=true`。Billing 与 Ledger 双层拒绝 `cost > reservation.Amount`。
+- `Billing.Recover` 启动执行一次，随后每 30 秒运行：幂等完成 `consumed_unsettled`，退款超过 5 分钟仍未发送的 `reserved`；超过 24 小时的 `in_flight` 返回歧义告警供人工按 channel 对账，但保持冻结并继续服务。新鲜 in_flight 不告警、不退款，避免多实例滚动启动误报。
+- OpenAI 请求显式拒绝 `n != 1`。release 为每个启用的 `channel/upstream_model` 配置 `max_tokens|max_completion_tokens`；候选确定后删除两个同义字段，只写策略指定字段，再进入 MarkInFlight。stream 等安全字段总会重编码，精确重复 JSON key 被折叠。
+- 测试覆盖状态机、独立缓存费率与最贵输入预授权、cost 上限、`n=1`、重复安全字段重编码、usage 完整性、并发预授权及发送结果未知不重放。真实 PostgreSQL 故障注入与旧余额对账仍是部署门槛。
 
 ### 第 7 步 · 数据库 schema + sqlc 集成
-- **sqlc 工程**（仓库根）：`sqlc.yaml`（engine=postgresql, sql_package=pgx/v5）+ `db/schema.sql`（四表：users / api_keys / channels / usage_logs）+ `db/query.sql`（带 sqlc 注解的查询定义）。金额列统一 `BIGINT`（最小计费单位，杜绝浮点误差），时间戳 `timestamptz`，软删除用 `enabled` 布尔。
+- **sqlc 工程**（仓库根）：`sqlc.yaml`（engine=postgresql, sql_package=pgx/v5）+ `db/schema.sql` + `db/query.sql`。资金相关新增 `users.balance_version`、`billing_reservations` 与只追加 `billing_ledger`；金额列统一 `BIGINT`，时间戳用 `timestamptz`。
 - **⚠️ 手写同构产物**：当前环境无法联网装 sqlc 二进制，故 `internal/db/` 下的代码是**按 sqlc 生成约定手写**的等价物（`db.go` 骨架 + `models.go` 表模型 + `querier.go` 接口 + `*.sql.go` 查询实现）。一旦能装 sqlc，`sqlc generate` 可**原样覆盖**该目录，接口与调用方零改动。
-- **PostgreSQL 实现 `store.Store`**：`store.PGStore` 用 sqlc 查询实现 `ResolveKey` / `Balance`。API Key 只存 **SHA-256 摘要**（`HashAPIKey`），不落明文；`ResolveAPIKey` 联表过滤 `enabled=TRUE`，任一禁用/不存在映射为 `ErrKeyNotFound`；余额未命中按 0 返回（闸门自然拦截）。
-- **PostgreSQL 实现 `billing.Sink`**：`billing.PGSink` 把用量日志写 `usage_logs`，SQL 用 `ON CONFLICT (request_id) DO NOTHING` 保证**按请求幂等**（进程崩溃重放不重复记账）。
-- **连接池 + 建表**：`db.NewPool` 建 `pgxpool` + 启动期 Ping 探测；`db.ApplySchema` 用 `//go:embed schema.sql` 幂等建表（全部 `IF NOT EXISTS`）。`internal/db/schema.sql` 是运行时迁移副本，与根 `db/schema.sql` 内容一致（改表两处同步）。
-- **充值热副本同步**：`billing.Account.Sync` / `Billing.SyncBalance` 用冷源权威余额 `SET` 覆盖 Redis 热副本并续期——补上惰性 seed 覆盖不到的充值场景。
-- **main 接线**：新增 `buildDataLayer`——`database.enabled=true` 则建池 +（可选 `auto_migrate`）建表 + 装配 `PGStore`/`PGSink`（连不上视为致命）；`=false` 回退内存 `MemoryStore` + `NopSink`（本地开发免装 DB）。config `database` 段新增 `enabled` / `auto_migrate` 开关。
-- 测试覆盖：PGStore（哈希稳定性/身份映射/`ErrNoRows`→`ErrKeyNotFound`/余额未命中归零，用 fake Querier）、PGSink（字段+时间映射/错误透传/空批次）、Account.Sync（覆盖旧热副本/新建热副本，用 miniredis），全过 `-race`。
+- **PostgreSQL 实现 `store.Store`**：`store.PGStore` 用 sqlc 查询实现 `ResolveKey` / `Balance`。API Key 只存 SHA-256 摘要；`ResolveAPIKey` 联表过滤密钥与用户启用状态。资金准入由 PostgresLedger 的条件扣款决定，不依赖 Store 余额快照。
+- **PostgreSQL 实现 `billing.Ledger`**：`PostgresLedger` 在事务内维护权威余额、reservation 状态、资金流水与最终用量日志；`usage_logs.request_id` 使用服务端生成的 reservation ID，外部 trace ID 单独保存在 reservation 中。
+- **连接池 + 版本化迁移**：`db.NewPool` 建 pool + Ping。全新库用 embed schema；既有库由 `schema_migrations` + checksum + 事务 advisory lock 顺序执行 `internal/db/migrations/*.sql`。`auto_migrate=false` 时 `VerifySchema` 拒绝缺版本、迁移漂移和降级运行。
+- **main 接线**：`database.enabled=true` 装配 `PGStore` + `PostgresLedger`；关闭数据库时使用同一 `MemoryStore` + `MemoryLedger`，仅供 debug 开发。release 模式强制启用 PostgreSQL。
+- 迁移只处理 schema，不会把旧 Redis 消费反推到 PostgreSQL。真实 PG 增量升级尚未在本环境演练；首次部署新账本前仍须人工对账并校正 `users.balance`。
 
 ### 第 8 步 · 转发层（接线收尾）
 - `internal/forwarder` 新增，把「适配器 + 路由 + 熔断 + 计费」串成真正发 HTTP 的胶水层：
-  - **channels.go**：`ChannelsFromConfig` / `ChannelsFromDB` 把两种渠道来源（config 段、`db.ListEnabledChannels` 行）统一转成 `routing.Channel`；DB 的 `models` JSON 列解析失败即报错（不静默污染路由）。含 `newSSEReader`：按空行切分 SSE 记录的读取器。
-  - **forwarder.go**：`Forwarder.Handler(clientFormat)` 返回 gin handler。主循环：`ParseRequest`（客户端格式）→ 回填 `middleware.SetReservationModel` 供计价 → `router.Select(model)` 拿候选 → 逐候选 `Breaker.Allow()` 准入 → 发上游 → 按成败 `RecordSuccess/Failure` 并决定故障转移。终局统一结算：成功且有用量 → `billing.Settle` 退差；否则 `billing.Refund` 全额退押金。
-  - **upstream.go**：`http.Client` 封装，`BuildRequest` 构造上游请求（注入渠道凭证与上游模型名），区分流式/非流式响应。**故意不设整体超时**（SSE 长回复），仅设连接/握手超时。
-  - **nonstream.go**：非流式链路 `ParseResponse`（渠道格式）→ `BuildResponse`（客户端格式）→ 透传状态码与用量。
-  - **stream.go**：流式链路，逐 SSE 记录 `StreamDecoder.Decode` → 累计用量 → `StreamEncoder.Encode` → flush。**响应头惰性写出**：首个输出块前才 `setSSEHeaders`，使「响应提交点」与 `committed` 标志一致——首块之前的上游失败仍可故障转移，已提交后再断则只结算不重试。
-- **候选失败语义**：上游 5xx / 网络错 = 渠道故障（`RecordFailure` + 故障转移到下一候选）；上游 4xx = 客户端错（透传、不转移、不计费用量）。
+  - **channels.go / output_limit.go**：统一 config/DB 渠道；坏的 models JSON 直接报错。OpenAI 输出字段 resolver 在 release 验证每个启用 `channel/upstream_model`，候选确定后只写唯一策略字段。
+  - **forwarder.go**：先解析、强制 `n=1`/输出上限并持久预授权；候选级输出字段补丁和 prepare 完成后才 `MarkInFlight`。明确未消费的 4xx 才 ReleaseAttempt；发送结果未知时保留预授权并停止自动重放。
+  - **target_policy.go / upstream.go**：release 默认公共 HTTPS；精确 authority 规则才可授权 HTTP/私网 CIDR。URL 静态校验 + 拨号期 DNS/IP 校验防 SSRF/rebinding。禁自动重定向；响应头 30s、非流整体 120s、SSE idle 2min，非流响应 32MiB、SSE 单记录 4MiB。
+  - **nonstream.go**：非流式链路显式跟踪 usage 完整性；2xx 即视为已消费，缺失/部分 usage 走保守结算而非退款。
+  - **stream.go**：标准 SSE 语义与最终 usage；每次下行写刷新 30s deadline。Anthropic→OpenAI 生成标准 `choices:[]` usage 尾块；反向迟到 input 不可表达时保守结算。
+- **候选失败语义**：permit 区分 success/failure/neutral；客户端取消不污染 breaker。只有明确 allowlist 4xx 可 ReleaseAttempt；3xx、网络错、408、5xx 和未知自定义 4xx 保留 `in_flight`。异常多 choices/index 已消费后显式失败，不重试。
 - **接线三处**：`cmd/linapi` 补 `_ "linapi/internal/adapter/all"` 空导入触发适配器注册；启动时 `buildDataLayer` 一并加载渠道（PG 从 `channels` 表、否则 config）喂给 `routing.NewRouter`；`server.Deps` 新增 `Forwarder`，`/v1/chat/completions`（openai）与 `/v1/messages`（anthropic）替换 501 占位。
 - **新增汇总包** `internal/adapter/all`：集中 blank-import 各供应商适配器，供 main 一行导入。
 - config `channels` 段 + `config.example.yaml` 补文档化示例（含跨供应商故障转移：对外 gpt-4o 回退到 Claude）。
-- 测试覆盖：channels（config/DB 转换、坏 JSON、空 models）、SSE reader（多记录/无尾空行/EOF）、集成（非流式成功+计费、跨格式 OpenAI→Anthropic、故障转移、全败 502 退款、上游 4xx 透传不转移、余额不足 402、无渠道 503）、流式（同格式直通、跨格式转换、chunk 计数、**故障转移前未提交可换渠道**）；全过 `-race`。
+- 测试覆盖：channels、SSE reader、非流式/流式成功结算、明确拒绝时的安全故障转移、发送结果未知时不重放/不退款、余额不足 402 与无渠道 503。
 
 ### 第 9 步 · 管理面 + 可观测性 + 直通优化（运维增强）
 - **管理面 CRUD**（`internal/admin` + `internal/server/admin_handlers.go`）：用户/密钥/渠道的增删改查 REST API。
-  - `store.AdminStore` 接口 + 内存/PG 双实现：用户增查改（含 `AddBalance` 充值，同步刷新 Redis 热副本）、密钥增查改、渠道全 CRUD。
-  - `admin.Service` 门面聚合 AdminStore + Router + Billing；渠道写操作（增/改/删/启停）后触发 `router.UpdateChannels` 从 DB 重载，**即时生效无需重启**。
-  - `/admin` 分组受独立 `AdminAuth` 中间件保护：独立 token（与 `/v1` 鉴权隔离）+ 可选回环地址限制（`loopback_only`）。
+  - `store.AdminStore` 接口 + 内存/PG 双实现：用户增查改（`AddBalance` 直接修改与账本相同的权威余额）、密钥增查改、渠道全 CRUD。
+  - `admin.Service` 门面聚合 AdminStore + Router；渠道写操作后触发 `router.UpdateChannels` 从 DB 重载，即时生效无需重启。
+  - 本步骤最初使用独立 `AdminAuth` token；第 11～12 步已由账户会话、角色校验、session version 与 CSRF 完整替代，旧 token/loopback 配置已退役。
   - 密钥创建返回明文一次（此后只存 SHA-256 摘要），对齐主流网关做法。
-- **渠道定时热重载**（`cmd/linapi`）：后台 goroutine 按 `admin.reload_interval` 定期从 DB 重载渠道喂 `router.UpdateChannels`；与管理面写触发的即时重载互补，兜底多实例部署下他实例的改动。间隔 <=0 关闭。
+- **渠道定时热重载**（`cmd/linapi`）：后台 goroutine 按 `admin.channel_reload_interval` 定期从 DB 重载渠道喂 `router.UpdateChannels`；与管理面写触发的即时重载互补。间隔 <=0 关闭。
 - **Prometheus 指标**（`internal/metrics` + `internal/middleware/metrics.go`）：`client_golang` 注册指标 + `/metrics` 暴露端点。
   - HTTP 层：请求总数（按 path/method/status）、请求耗时直方图。
   - 转发层：上游调用总数（按渠道/格式/成败）、上游耗时直方图、每渠道熔断器状态 gauge。
-  - `/metrics` 不走鉴权，依赖部署层网络隔离（仅内网/监控可达）。
+  - `/metrics` 使用专用 bearer token，并限制最大并发抓取和单次超时；release 空 token 拒绝启动。
 - **`/v1/models` 端点**：`Forwarder.Models()` 从路由引擎的启用渠道聚合去重对外模型名，`server.listModels` 按 OpenAI models 格式返回；替换原 501 占位。
 - **同格式直通优化**（`forwarder`）：客户端格式 == 渠道格式且该模型无重命名（`forwardCtx.canPassthrough`）时短路 canonical 往返——
-  - 请求侧逐字节透传客户端原始 body 到上游（跳过 `BuildRequest`）；
+  - 请求侧总是重新编码 JSON，强制 `n=1`、服务端输出上限、stream 与 OpenAI 流式 usage 开关；重复安全字段被折叠，未知字段语义保留；
   - 非流式响应透传上游字节回客户端（跳过 `BuildResponse`，但仍 `ParseResponse` 提取 usage 计费）；
   - 流式响应逐字节透传上游 SSE 记录（跳过 `StreamEncoder`，但仍 `Decode` 累计 usage）；
-  - 收益：省一次编解码开销 + **彻底避免 canonical 超集未覆盖字段的丢失**（自定义/厂商扩展字段原样保留）。有重命名或跨格式则回退原转换链路。
+  - 收益：无重命名响应避免 canonical 未建模字段丢失；同协议模型别名请求只在 raw JSON 上补丁 model/安全字段，响应仍经过 canonical；跨格式只保证已建模能力。
   - 重构：`tryCandidate` / `forwardNonStream` / `forwardStream` 签名统一收敛为 `forwardCtx`（聚合每次转发的不变量），消除参数爆炸。
-- 测试覆盖：直通逐字节透传（请求+响应含自定义字段保真）、重命名不走直通（改写上游模型名）、流式直通透传保真 + usage 仍计费；全过 `-race`。
+- 测试覆盖：直通最小 JSON 合并后未知字段保真、重命名不走直通（改写上游模型名）、流式直通响应保真 + usage 仍计费。
 
 ### 第 10 步 · 结构化访问日志 + 管理面测试补全（质量增强）
 - **结构化访问日志中间件**（`internal/middleware/logger.go`）：`RequestLogger` 全局挂载（`Recovery` 之后、最前），跳过 `/healthz`、`/metrics` 避免探活/抓取噪声。
-  - **request_id 贯通**：入口优先复用入站 `X-Request-Id` 头（跨服务串联），否则生成 `req_`+hex 随机 ID；注入 `gin.Context` 并回写 `X-Request-Id` 响应头。转发层改为复用该 ID（原先内部自生成、与访问日志割裂），使**访问日志与计费用量日志共享同一 request_id**，天然对账。
+  - **trace 与账单 ID 分离**：入口始终生成内部 request ID，不复用客户端 `X-Request-Id`；账本另用服务端 reservation ID。响应只透传 allowlist 上游头，值长度/控制字符受限。
   - **富字段**：转发层经 `SetLogModel` / `SetLogUpstream` / `SetLogUsage` 把模型/渠道/token 用量回填到请求级 `accessLog` 载体（单请求 goroutine 顺序读写，无锁）；收尾统一输出方法/路径/状态/耗时/客户端 IP/身份（user_id/key_id）/模型/渠道/用量，缺失字段省略。
   - **级别按状态码**：5xx→Error、4xx→Warn、其余→Info。
   - **协作方向**：`forwarder` 已依赖 `middleware`，故日志字段的 context 载体与 setter 定义在 `middleware`，转发层回填（不反向依赖）；`SetLog*` 在无中间件时（如转发层单测）退化为无操作。
@@ -125,16 +129,16 @@
 - **管理面测试补全**（此前 `internal/admin`、`internal/server` 零覆盖）：
   - `internal/admin`：MemoryStore 用户/密钥/渠道 CRUD（含冲突/未找到/分页/充值）、密钥对热路径即时可见与禁用即拒、Service 渠道写操作热更新 router（创建/删除/启停后 `router.Select` 立即反映）、nil router 不 panic、GenerateKey 前缀/长度/千次不重复。
   - `internal/server`：admin handler HTTP 全链路（无令牌 401、用户生命周期、密钥明文仅回显一次且列表不含明文、渠道上游 api_key 脱敏、非法 format 400、删除 204/再删 404）。
-  - `internal/middleware`：logger 中间件行为（生成/复用 request_id、响应头、skip 路径、字段回填、级别映射、无中间件不 panic）。
+- `internal/middleware`：logger 中间件行为（始终生成内部 request_id、不信任入站 ID、响应头、skip 路径、字段回填、级别映射、无中间件不 panic）。
 
 ### 第 11 步 · 统一账户认证体系（控制台后端）
 把管理面从「裸 token」升级为「账号密码 + 会话」的完整控制台后端，账户体系与计费实体解耦。分 16 个子任务经子代理驱动开发（每任务 TDD + 独立复核）落地。
 - **账户领域**（`internal/account`）：登录账户（`accounts` 表：用户名/bcrypt 密码哈希/角色/关联 external_id）与计费实体（`users` 表）职责分离。`AccountStore` + `SettingsStore` 接口，内存与 PostgreSQL 双实现。建 user 账户**原子连带**创建计费实体并回填 external_id（PG 走事务，任一步失败整体回滚不留孤儿）。`Account` 领域视图刻意无 `PasswordHash` 字段（结构层杜绝哈希外泄），仅 `Credentials`（不序列化）含哈希供登录校验。角色仅 `admin`/`user`（`ValidRole` 把关）。预留 `group_name` / `rate_multiplier`（整数百分比倍率）存而未用。
-- **密码哈希**（`internal/account`）：bcrypt 封装，`HashPassword`（最短 8 位，短于则 `ErrPasswordTooShort`）/ `VerifyPassword`。绝不存明文。
-- **会话管理**（`internal/session`）：Redis 会话，`Manager` 生成不透明会话 ID（crypto/rand），`SessionData`（AccountID/Username/Role/ExternalID）JSON 存 Redis 带 TTL；「记住我」延长 TTL。登出即删。
-- **鉴权中间件**（`internal/middleware/session_auth.go`）：`SessionAuth` 从 HttpOnly Cookie 取会话 ID 查 Redis，注入 `SessionData` 到 context（无会话 401）；`RequireRole` 校验角色（取不到会话或角色不符均拒，**fail-closed**）。Cookie 属性 HttpOnly + SameSite=Strict + 可选 Secure（生产 HTTPS）。
+- **密码哈希**（`internal/account`）：bcrypt；至少 8 个 Unicode 字符、最多 72 字节。绝不存明文。
+- **会话管理**（`internal/session`）：Redis key/ZSET 只存 token 摘要；Lua 原子清理过期项并限制每账户活跃数量。`SessionData` 承载 CSRFToken/SessionVersion。
+- **鉴权中间件**：受保护路由使用 `SessionAuthWithVersion`，禁用/改密后旧会话立即失效；`/admin` 叠 `RequireRole(admin)`，`/me` 与 `/admin` 写请求叠 `CSRFProtect`。
 - **控制台端点**：`/auth`（register 受注册开关约束 / login / logout / me）、`/me`（用户自助：改自己的密钥，key 归属绑定会话身份，**越权硬约束**——操作他人 key 返回 404 而非 403，不泄存在性）、`/admin/accounts`（账户增删改查启停 + 重置密码）、`/admin/settings`（注册开关 + 新用户初始额度）。
-- **鉴权收口**：`/admin` 由裸 token 改为 `SessionAuth` + `RequireRole(admin)`（顺序：先会话后角色），退役 `AdminAuth` 中间件（全树无残留）；`/me` 挂 `SessionAuth`（任意登录角色）；`/auth` 的 register/login 不鉴权。各 `register*Routes` 有 nil 依赖守卫（依赖装配不全时不挂路由，fail-closed 而非请求期 panic）。
+- **鉴权收口**：`/admin` 由裸 token 改为 `SessionAuthWithVersion` + `RequireRole(admin)` + `CSRFProtect`；`/me` 使用 session version + CSRF；register/login 为匿名端点但先过来源 IP 限流和 bcrypt 并发闸门。各路由有 nil 依赖守卫。
 - **启动播种**（`cmd/linapi`）：`bootstrapAdmin` 在配置了 `admin.bootstrap.username` 且该用户名不存在时播种首个管理员（幂等，不覆盖已有；密码为空则告警跳过，绝不建空密码账户；日志只记 username 不记密码）。密码建议经 `LINAPI_ADMIN_BOOTSTRAP_PASSWORD` 环境变量注入。
 - config `admin` 段改造：去 `token` / `loopback_only`，加 `bootstrap`（username/password）；`SecureCookie = (server.mode == "release")`。schema 双写（`db/schema.sql` + `internal/db/schema.sql`）新增 `accounts` / `settings` 表 + `users.rate_multiplier` 列。
 - **附带修复**：`.gitignore` 裸 `linapi` 规则改 `/linapi` 锚定仓库根——原规则误伤 `cmd/linapi/` 源码目录，导致入口 `main.go` 长期未被 Git 跟踪（对应审查文档 `AUD-P1-09`）。
@@ -142,31 +146,52 @@
 
 ### 第 12 步 · 控制台安全加固（审查批次 A/G + P1-17）
 在开前端（Plan 2）前先闭合控制台攻击面——开前端需 `admin.enabled=true`，会点亮 `/auth` `/me` `/admin` 全部端点。按 codex 审查（`docs/reviews/2026-07-10-*.md`）逐项 TDD 修复：
-- **AUD-P1-01 · `/models` 误扣押金**：拆分 `/v1` 中间件分组——`Auth` + `RateLimit` 作公共前置，`Quota`（预扣押金）只挂真正产生上游用量的生成端点（`/chat/completions`、`/messages`）。`/models` 只读元数据端点不再每查一次就永久扣掉一笔 `default_reserve`。
-- **AUD-P1-03 · 余额不足 key 无 TTL**：Redis 计费 `adjustScript` seed 时即带 `EX ttl`。原实现余额不足会在 `EXPIRE` 前提前 return，留下永久 key，使后续冷源充值被陈旧热副本永久屏蔽。
+- **AUD-P1-01 · `/models` 误扣押金**：当时先把固定预扣只挂生成端点，确保 `/models` 不触碰资金；第 13 步进一步删除 Quota，预授权改为 Forwarder 解析后执行。
+- **AUD-P1-03 · 余额不足 key 无 TTL**：当时为 Redis Account seed 补齐 TTL；第 13 步已删除整个 Redis 资金路径，因此该故障面不再存在。
 - **AUD-P0-07 · 注册无限复制赠送额度**：自助注册恒绑定初始余额 0（忽略 `settings.NewUserInitialBalance`）；`putSettings` 拒绝把 `NewUserInitialBalance` 设为正数，双重堵死路径。发放额度只能走管理面主动建号 / 充值（可信操作）。
 - **AUD-P1-26 · CSRF 防护**：`middleware.CSRFProtect` 对 Cookie 鉴权的写请求做①双重提交 token（会话绑定的 `CSRFToken` vs 请求头 `X-CSRF-Token`）②强制 `Content-Type: application/json`③Origin/Referer 校验。登录下发非 HttpOnly 的 CSRF Cookie 供前端读取回传；`/me` `/admin` 写端点全挂，GET 自动放行。
-- **AUD-P1-27 · 登录注册滥用限速**：`/auth/login` `/auth/register` 在 bcrypt 之前按来源 IP 令牌桶限流（`IPRateLimiter`）+ 全局 bcrypt 并发信号量（容量 = CPU 核数），排不上队回 503，堵住撞库与 CPU 耗尽。
-- **AUD-P1-28 · 自助 Key 无上限**：自助建 key 强制 `rate_limit_per_min ∈ [1,5000]`（杜绝 0/负数=不限流与超大值绕过限流）、每账户 ≤50 把。管理面建 key 面向运维不受此限。
+- **AUD-P1-27 · 登录注册滥用限速（代码已修）**：来源 IP + 登录标识摘要 Redis 桶在 bcrypt 前执行；Gin 不信任代理头；`TryAcquire` 满载 503；会话创建以 Lua 原子限制每账户活跃数量。release 启用管理面时三项预算/上限均强制为正，不能用零值关闭。
+- **AUD-P1-28 · 自助 Key 无上限（已修）**：单 Key 1..5000；内存锁/PG advisory lock 原子执行“计数+创建”，每账户最多 50 把；`/v1` 叠账户总桶，无法用多 Key 线性放大吞吐。账户/用户列表有界分页，Key 列表由 50 上限约束。
 - **AUD-P1-29 · 登出假成功**：logout 用独立 3s 超时 context 删会话（不复用请求 context，避免客户端断开取消删除），删除失败回 503 且不清 Cookie，绝不让用户误以为已安全登出而服务端 token 仍有效。
 - **AUD-P1-17 · 会话撤销**：`accounts` 表加 `session_version`（schema 双写），禁用 / 改密时在数据层递增。登录把当前代次快照进会话，`SessionAuthWithVersion` 鉴权时回查账户当前代次比对：不一致即判定为陈旧会话，主动删除并 401；回查出错 fail-closed 回 503。在 `/auth`（logout/me）、`/me`、`/admin` 三处接线。使被盗 token、被禁用户 / 被禁管理员的旧 Cookie 立即失效。
 - 全量 `go build` / `go vet` / `CGO_ENABLED=1 go test -race ./...` 全绿。逐项证据见审查文档第 10 节跟踪表。
 
+### 第 13 步 · PostgreSQL 权威计费账本（审查批次 B）
+- 闭合 `AUD-P0-01～06`：资金从 Redis Lua 迁到 PostgreSQL 权威余额与持久 reservation/ledger 状态机；预授权金额按模型可证明的最坏成本计算；usage 缺失不再按 0；上游已消费后结算失败不再退款。
+- 随架构闭合 `AUD-P1-02`、`P1-06`、`P1-08`、`P1-11`、`P1-13`～`P1-16`、`P1-21`～`P1-24`、`P2-03` 的 Anthropic→OpenAI 方向、`P2-07`、`P2-14`、`P2-16`、`P2-23`。P1-23 以“请求 n!=1 提前拒绝 + 异常上游 choices/index 显式失败且不重试”闭合。`P1-12` 与 `P2-03` 反向迟到 usage 保持部分修复。
+- release 强制 `database.enabled=true`，逐模型验证价格/边界，并逐一验证启用 OpenAI `channel/upstream_model` 的输出字段策略。启动 Recover 的普通错误拒绝服务；`ErrAmbiguousReservations` 仅告警并保持冻结，周期恢复错误记日志后继续重试。
+- **迁移边界**：代码和 Schema 不能判断旧 Redis 热余额中包含哪些未落 PostgreSQL 的历史消费。首次上线前必须停写、人工对账并校正 `users.balance`，再验证余额总额与供应商账单；此步骤不允许由自动迁移猜测完成。
+- **验证边界**：内存状态机和 PostgreSQL 查询/事务契约已有自动化测试；生产放行前仍需在真实 PostgreSQL 上验证并发预授权、执行成功但响应丢失、事务提交结果未知、进程崩溃后 Recover、重复 Finalize/Refund 等故障路径。
+
+### 第 14 步 · PostgreSQL 渠道凭证加密（AUD-P1-33）
+- `channels.api_key` 改为应用层 AES-256-GCM v1 envelope：`crypto/rand` nonce、显式 key id、`channel_id` AAD；PG 创建/更新只写密文，读取在 `AdminStore` 边界解密后才进入路由，管理 API 的 `Channel` 结构从类型层禁止序列化密钥。
+- `database.enabled=true` 时主密钥缺失、非 32 字节 base64 或 key id 非法均 fail-closed；内存 debug 模式继续可用。主密钥建议经 `LINAPI_DATABASE_CHANNEL_KEY_ENCRYPTION_KEY_ID/KEY` 或 Secret Manager 注入。
+- 旧库默认检测到任一明文即拒绝启动。维护窗口仅一次开启 `migrate_plaintext`，启动事务用 `FOR UPDATE` 锁定全表、验证已有 envelope、条件改写明文并整体提交；schema 的 `NOT VALID` 检查约束从安装起阻止新增明文，迁移后再全表验证。迁移完成后必须关闭开关并轮换原有供应商密钥。
+- 渠道 PUT 省略 `api_key` 时由 SQL 原子保留旧密文；显式提供才换新密文。单元、SQL、配置、handler、`-race` 与 `go vet` 回归已覆盖。
+
+### 第 15 步 · 审查剩余批次集中闭合
+- **路由/取消**：P1-04/P1-05 用 generation permit 与 neutral cancel 解决半开名额泄漏和迟到结果污染。
+- **超时与资源**：P1-07/P1-19/P1-20/P1-30、P2-05/P2-17/P2-22 已落实响应头/SSE idle/下行写期限、入站读闲置/body/header、live/ready、脱敏 Recovery、metrics token/max-inflight/timeout。
+- **协议**：P1-10/P1-23/P1-25、P2-01/02/03/04 已落实联合字段、developer、tool_result 图片、RawMessage/UseNumber、n=1 明确边界、错误 envelope/安全头与标准 OpenAI usage 尾块。
+- **网络与凭证**：P1-31/P1-32/P1-34、P2-24 已落实 URL+拨号双层 SSRF、Redis TLS/ACL/session digest、鉴权前 IP/并发闸门、内部 request ID/header 上限与 go-redis v9.7.3。真实 Redis TLS 集成尚未执行。
+- **管理/数据契约**：P1-18、P2-06、P2-08～13/P2-15/P2-18～21 已按参数边界、原子快照、Unicode/bcrypt、账户不变量、PG/内存错误与数值语义、Redis TIME、唯一性/时间/溢出、注册枚举方向修复；P2-10 迁移框架代码完成但真实 PG 未验。
+
 ## 测试现状
 
-- 172 个测试函数，分布在 38 个文件。
-- 全部通过，且 `CGO_ENABLED=1 go test -race ./...` 干净（gcc 已装好，路径见 CLAUDE.md）。
-- billing / account / session 用 `miniredis`（内嵌 Lua）真实执行原子脚本；PGStore / PGSink / account.PGStore 用 fake Querier 单测（不依赖真实 PG）；转发层用 `httptest` 起模拟上游 + `miniredis`，走鉴权→额度→转发全链路集成测试（含流式与同格式直通保真）；管理面与控制台（admin/account/server）用内存 Store + `httptest` 走 HTTP 全链路；访问日志中间件用 `bytes.Buffer` 捕获 JSON 日志断言字段。控制台安全（第 12 步）：CSRF 双重提交 / IP 限速 / bcrypt 信号量 / 会话代次撤销均有针对性测试，会话失效走「登录→禁用或改密→旧 Cookie 再访问应 401」端到端断言。
+- 2026-07-11 当前工作区已新增 breaker generation/neutral、协议 union/developer/tool/choices、HTTP/SSE timeout、SSRF、登录/Key 限额、Redis TLS/session digest、渠道加密、迁移、协议错误、metrics 预算等回归；最终提交以根任务本轮全量 go test/vet/race 结果为准。
+- 真实 PostgreSQL 的版本升级、账本故障注入/重放及旧余额对账未在本环境完成；真实 Redis TLS/ACL 连接也未跑。这些是上线验收缺口，不得由 mock/单元测试替代。
 
 ## 端到端现状
 
-七步骨架 + 转发层 + 运维增强已齐，请求可端到端跑通：客户端（OpenAI / Claude 格式）→ 鉴权/限流/额度预扣 → 转发层解析→路由选渠道→（同格式直通 或 跨格式转换）→发上游→反向转换→计费结算。非流式与流式（SSE）均已打通，支持跨供应商故障转移与熔断。管理面（用户/密钥/渠道 CRUD，渠道改动即时热生效）、Prometheus 指标（`/metrics`）、`/v1/models` 端点均已就绪。
+七步骨架 + 转发层 + 安全批次已齐：协议上下文/body/recovery → 未鉴权 IP/查库闸门 → 账户/Key 限流 → 解析并强制模型上限 → PG 最坏成本预授权 → generation permit → 候选字段与 SSRF 校验 → MarkInFlight → 带超时发送 → 反向转换/安全错误头 → 持久结算。usage 缺失/冲突保守结算，只在明确未消费时故障转移。
 
 ## 后续可选增强（非阻塞）
 
 当前实现已可用且具备基本运维能力（管理面 / 指标 / 热重载 / 直通优化已落地）。以下为仍可继续的增强：
+- **计费上线验证不是可选增强**：旧余额人工对账与真实 PostgreSQL 故障注入尚未完成，完成前不得把 release 部署视为财务正确性已验收。
 - **链路追踪**：结构化访问日志（`RequestLogger`，request_id 贯通）+ Prometheus 指标已铺开，但尚无分布式追踪（OpenTelemetry span 传播）。
 - **控制台前端**：本轮完成的是控制台**后端**（`/auth` `/me` `/admin`）；登录页 / 管理控制台 UI / 用户面板属另一份前端计划（Plan 2），尚未实现。
-- **认证体系可继续增强**：账户认证（账号密码 + 会话 + admin/user 角色）+ 控制台安全加固（CSRF、登录注册限速、自助 Key 上限、会话代次撤销、注册不送额度）已落地（见第 12 步）；仍可扩展的有——审计日志、更细粒度 RBAC（当前仅 admin/user 两级）、`rate_multiplier` / `group_name` 预留字段的实际启用、每账户活跃会话数上限。
+- **安全上线验证**：真实 Redis TLS/ACL 集成、真实 PG 迁移/故障注入、渠道明文维护迁移与历史 key 轮换尚未完成；这些不是可选增强。
+- **认证后续增强**：基础 IP/标识/bcrypt/会话/账户总桶/原子 Key 上限已落地；更细粒度 RBAC、专用安全审计日志与可选 MFA 属后续增强。
 - **更多供应商适配器**：当前 openai / anthropic 两家；Gemini 等可按注册机制扩展。
 - **sqlc 为手写同构产物**：`internal/db/` 是按 sqlc 约定手写的等价代码（环境无法联网装 sqlc）；能装 sqlc 后 `sqlc generate` 可原样覆盖。改表结构时记得同步根 `db/schema.sql` 与 `internal/db/schema.sql` 两份。

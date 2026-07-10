@@ -14,13 +14,23 @@ func (a *Adapter) ParseRequest(raw []byte) (*canonical.Request, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, fmt.Errorf("openai: 解析请求失败: %w", err)
 	}
+	maxTokens := req.MaxTokens
+	if req.MaxCompletionTokens != nil {
+		if maxTokens != nil && *maxTokens != *req.MaxCompletionTokens {
+			return nil, fmt.Errorf("openai: max_tokens 与 max_completion_tokens 冲突")
+		}
+		maxTokens = req.MaxCompletionTokens
+	}
+	if req.N != nil && *req.N != 1 {
+		return nil, fmt.Errorf("openai: 当前仅支持 n=1")
+	}
 
 	out := &canonical.Request{
 		Model:       req.Model,
-		MaxTokens:   req.MaxTokens,
+		MaxTokens:   maxTokens,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
-		Stop:        req.Stop,
+		Stop:        append([]string(nil), req.Stop...),
 		Stream:      req.Stream,
 	}
 
@@ -36,15 +46,20 @@ func (a *Adapter) ParseRequest(raw []byte) (*canonical.Request, error) {
 		out.ToolChoice = tc
 	}
 
-	// 消息：system 提升到顶层；tool 结果并入前一条 user 消息的 ToolResult block。
+	// 消息：system/developer 都作为有序消息保留，避免提升到顶层后改变优先级
+	// 或相对位置；tool 结果并入前一条 user 消息的 ToolResult block。
 	for _, m := range req.Messages {
 		switch m.Role {
-		case "system":
+		case "system", "developer":
 			blocks, err := parseContentToText(m.Content)
 			if err != nil {
 				return nil, err
 			}
-			out.System = append(out.System, blocks...)
+			role := canonical.RoleSystem
+			if m.Role == "developer" {
+				role = canonical.RoleDeveloper
+			}
+			out.Messages = append(out.Messages, canonical.Message{Role: role, Content: blocks})
 
 		case "user":
 			blocks, err := parseUserContent(m.Content)
@@ -115,19 +130,15 @@ func parseAssistantContent(m chatMessage) ([]canonical.ContentBlock, error) {
 	}
 
 	for _, tc := range m.ToolCalls {
-		var input map[string]any
-		if tc.Function.Arguments != "" {
-			// arguments 是 JSON 字符串，展开为结构化 map。
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
-				return nil, fmt.Errorf("openai: 解析工具参数失败: %w", err)
-			}
-		}
-		blocks = append(blocks, canonical.ContentBlock{
+		block := canonical.ContentBlock{
 			Type:      canonical.BlockToolUse,
 			ToolUseID: tc.ID,
 			ToolName:  tc.Function.Name,
-			ToolInput: input,
-		})
+		}
+		// arguments 是 JSON 字符串，可能为空、非对象或模型暂时截断。
+		// 原文始终保留；只有完整对象才生成 ToolInput 语义视图。
+		block.SetToolInputJSON([]byte(tc.Function.Arguments))
+		blocks = append(blocks, block)
 	}
 
 	return blocks, nil

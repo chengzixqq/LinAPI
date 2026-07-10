@@ -23,13 +23,8 @@ func (a *Adapter) ParseResponse(raw []byte) (*canonical.Response, error) {
 	for _, b := range resp.Content {
 		out.Content = append(out.Content, blockToCanonical(b))
 	}
-	if resp.Usage != nil {
-		out.Usage = canonical.Usage{
-			InputTokens:              resp.Usage.InputTokens,
-			OutputTokens:             resp.Usage.OutputTokens,
-			CacheCreationInputTokens: resp.Usage.CacheCreationInputTokens,
-			CacheReadInputTokens:     resp.Usage.CacheReadInputTokens,
-		}
+	if usage := canonicalUsageFromWire(resp.Usage); usage != nil {
+		out.Usage = *usage
 	}
 	return out, nil
 }
@@ -42,15 +37,14 @@ func (a *Adapter) BuildResponse(resp *canonical.Response) ([]byte, error) {
 		Role:       "assistant",
 		Model:      resp.Model,
 		StopReason: mapStopReasonToWire(resp.StopReason),
-		Usage: &usage{
-			InputTokens:              resp.Usage.InputTokens,
-			OutputTokens:             resp.Usage.OutputTokens,
-			CacheCreationInputTokens: resp.Usage.CacheCreationInputTokens,
-			CacheReadInputTokens:     resp.Usage.CacheReadInputTokens,
-		},
+		Usage:      wireUsageFromCanonical(resp.Usage),
 	}
 	for _, b := range resp.Content {
-		out.Content = append(out.Content, canonicalToBlock(b))
+		wire, err := canonicalToBlock(b)
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: 编码响应 block 失败: %w", err)
+		}
+		out.Content = append(out.Content, wire)
 	}
 	return json.Marshal(out)
 }

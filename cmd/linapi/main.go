@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -26,7 +28,6 @@ import (
 	_ "linapi/internal/adapter/all" // 触发各供应商适配器 init() 注册
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -37,6 +38,37 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载配置失败: %v", err)
 	}
+	channelKeys, err := channelKeyCipherForConfig(cfg)
+	if err != nil {
+		log.Fatalf("PostgreSQL 渠道密钥加密配置无效: %v", err)
+	}
+	if cfg.Server.Mode == "release" && !cfg.Database.Enabled {
+		log.Fatal("release 模式必须启用 PostgreSQL 持久账本（database.enabled=true）")
+	}
+	if cfg.Server.Mode == "release" && (cfg.Server.ReadTimeoutSeconds <= 0 ||
+		cfg.Server.IdleTimeoutSeconds <= 0 || cfg.Server.MaxRequestBodyBytes <= 0 || cfg.Server.MaxHeaderBytes <= 0) {
+		log.Fatal("release 模式必须配置非零 server.read_timeout_seconds、idle_timeout_seconds、max_request_body_bytes 与 max_header_bytes")
+	}
+	if cfg.Server.Mode == "release" && cfg.Server.MetricsToken == "" {
+		log.Fatal("release 模式必须通过 server.metrics_token 保护 /metrics")
+	}
+	if cfg.Server.Mode == "release" &&
+		(cfg.Server.MetricsMaxRequestsInFlight <= 0 || cfg.Server.MetricsTimeoutSeconds <= 0) {
+		log.Fatal("release 模式必须配置正数 server.metrics_max_requests_in_flight 与 metrics_timeout_seconds")
+	}
+	if cfg.Server.Mode == "release" &&
+		(cfg.Auth.UnauthenticatedRateLimitPerMin <= 0 || cfg.Auth.AccountRateLimitPerMin <= 0) {
+		log.Fatal("release 模式必须配置正数 auth.unauthenticated_rate_limit_per_min 与 account_rate_limit_per_min")
+	}
+	if cfg.Server.Mode == "release" && cfg.Admin.Enabled &&
+		(cfg.Admin.AuthRateLimitPerMin <= 0 || cfg.Admin.AuthIdentifierRateLimitPerMin <= 0 ||
+			cfg.Admin.MaxActiveSessionsPerAccount <= 0) {
+		log.Fatal("release 管理面必须配置正数 admin.auth_rate_limit_per_min、auth_identifier_rate_limit_per_min 与 max_active_sessions_per_account")
+	}
+	if cfg.Database.MinIdleConns < 0 || cfg.Database.MaxOpenConns <= 0 ||
+		cfg.Database.MinIdleConns > cfg.Database.MaxOpenConns {
+		log.Fatal("database.min_idle_conns 必须在 0 到 max_open_conns 之间")
+	}
 
 	// 结构化日志器：按配置选级别与格式（json/text），设为全局默认，
 	// 供未显式注入 logger 的组件（slog.Default()）复用。
@@ -44,6 +76,9 @@ func main() {
 	slog.SetDefault(logger)
 
 	// Redis：限流等分布式状态的强依赖，连不上直接退出。
+	if err := redisx.ValidateSecurity(cfg.Redis, cfg.Server.Mode == "release"); err != nil {
+		log.Fatalf("Redis 安全配置无效: %v", err)
+	}
 	rdb, err := redisx.New(cfg.Redis)
 	if err != nil {
 		log.Fatalf("初始化 Redis 失败: %v", err)
@@ -51,27 +86,75 @@ func main() {
 	defer func() { _ = rdb.Close() }()
 
 	// 数据访问层：DB 启用则用 PostgreSQL（sqlc 查询），否则回退配置驱动的内存实现。
-	dl := buildDataLayer(cfg)
+	dl := buildDataLayer(cfg, channelKeys)
 	if dl.pool != nil {
 		defer dl.pool.Close()
 	}
 
-	// 计费门面：Redis 原子预扣/退差 + 用量日志异步落库。
-	// recorder 单独持有，优雅关闭时冲刷残留日志。sink 由数据层决定
-	// （PG 启用时为 PGSink 批量落库，否则 NopSink 丢弃）。
-	bill, recorder := buildBilling(cfg.Billing, rdb, dl.sink)
-	defer recorder.Close()
+	// 计费门面：PG/内存 Ledger 持久预授权 + 幂等结算。Redis 只承担限流与会话，
+	// 不再参与任何资金增量修改。
+	bill := buildBilling(cfg.Billing, dl.ledger, cfg.Server.Mode == "release")
+	if cfg.Server.Mode == "release" {
+		seenModels := make(map[string]struct{})
+		for _, ch := range dl.channels {
+			for model := range ch.Models {
+				seenModels[model] = struct{}{}
+			}
+		}
+		for model := range seenModels {
+			if err := bill.ValidateModel(model); err != nil {
+				log.Fatalf("模型 %q 缺少安全计费策略: %v", model, err)
+			}
+		}
+	}
+	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := bill.Recover(recoverCtx); err != nil {
+		if errors.Is(err, billing.ErrAmbiguousReservations) {
+			log.Printf("警告：检测到发送结果不确定的历史预授权，已保持冻结等待人工对账: %v", err)
+		} else {
+			recoverCancel()
+			log.Fatalf("恢复未完成计费结算失败: %v", err)
+		}
+	}
+	recoverCancel()
+	stopBillingRecovery := startBillingRecovery(bill, logger)
+	defer stopBillingRecovery()
 
 	// 路由引擎 + 转发层：把适配器 + 路由 + 熔断 + 计费串起来真正发 HTTP。
+	outputLimits, err := forwarder.NewOpenAIOutputLimitResolver(
+		cfg.Billing.OpenAIOutputLimitFields,
+		cfg.Server.Mode == "release",
+	)
+	if err != nil {
+		log.Fatalf("OpenAI 输出上限字段策略无效: %v", err)
+	}
+	if cfg.Server.Mode == "release" {
+		if err := outputLimits.ValidateChannels(dl.channels); err != nil {
+			log.Fatalf("OpenAI 输出上限字段策略不完整: %v", err)
+		}
+	}
+	targetPolicy, err := forwarder.NewUpstreamTargetPolicy(cfg.Upstream, cfg.Server.Mode == "release")
+	if err != nil {
+		log.Fatalf("上游目标策略无效: %v", err)
+	}
+	if err := targetPolicy.ValidateChannels(dl.channels); err != nil {
+		log.Fatalf("上游渠道目标不安全: %v", err)
+	}
+	validateChannel := func(ch *routing.Channel) error {
+		if err := targetPolicy.ValidateChannel(ch); err != nil {
+			return err
+		}
+		return outputLimits.ValidateChannel(ch)
+	}
 	router := routing.NewRouter(dl.channels, routing.DefaultBreakerConfig())
 	log.Printf("路由引擎已加载 %d 个渠道", len(dl.channels))
-	fwd := forwarder.New(router, bill, logger)
+	fwd := forwarder.NewWithPolicies(router, bill, outputLimits, targetPolicy, logger)
 
 	// 管理面服务：用户/密钥/渠道 CRUD，渠道写操作触发 router 热更新。
-	adminSvc := admin.NewService(dl.adminStore, router, logger)
+	adminSvc := admin.NewServiceWithChannelValidator(dl.adminStore, router, logger, validateChannel)
 
 	// 会话管理器：控制台登录态载体（Redis）。
-	sessions := session.NewManager(rdb)
+	sessions := session.NewManagerWithLimit(rdb, cfg.Admin.MaxActiveSessionsPerAccount)
 
 	// 播种首个管理员账户（仅当配置了 bootstrap 且该用户名不存在时）。
 	bootstrapAdmin(cfg, dl.account, logger)
@@ -87,6 +170,17 @@ func main() {
 		Session:      sessions,
 		SecureCookie: cfg.Server.Mode == "release", // 生产（release）走 HTTPS，加 Secure。
 		Logger:       logger,
+		Ready: func(ctx context.Context) error {
+			if err := rdb.Ping(ctx).Err(); err != nil {
+				return fmt.Errorf("Redis 未就绪: %w", err)
+			}
+			if dl.pool != nil {
+				if err := dl.pool.Ping(ctx); err != nil {
+					return fmt.Errorf("PostgreSQL 未就绪: %w", err)
+				}
+			}
+			return nil
+		},
 	})
 
 	// 渠道定时热重载：多实例部署时，本实例通过定期从存储重载收敛其它实例的渠道变更。
@@ -94,18 +188,23 @@ func main() {
 	stopReload := startChannelReload(cfg, dl.pool != nil, adminSvc)
 	defer stopReload()
 
-	// 在独立 goroutine 中启动，以便主协程监听退出信号。
+	// 在独立 goroutine 中启动，并把错误交回主协程；不能在 goroutine 内
+	// log.Fatal/os.Exit，否则 PostgreSQL、Redis 与恢复任务的 defer 全被跳过。
+	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("LinAPI 网关已启动，监听 %s", srv.Addr())
-		if err := srv.Start(); err != nil {
-			log.Fatalf("服务器异常退出: %v", err)
-		}
+		serverErr <- srv.Start()
 	}()
 
-	// 等待 SIGINT / SIGTERM，触发优雅关闭。
+	// 等待 SIGINT / SIGTERM 或启动/运行错误。
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	select {
+	case err := <-serverErr:
+		log.Printf("服务器异常退出: %v", err)
+		return
+	case <-quit:
+	}
 
 	log.Println("收到退出信号，正在优雅关闭...")
 
@@ -113,7 +212,9 @@ func main() {
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("关闭超时，强制退出: %v", err)
+		// 返回 main 仍会执行全部 defer；由外部进程管理器按日志/健康检查拉起。
+		log.Printf("关闭超时: %v", err)
+		return
 	}
 
 	log.Println("已安全退出")
@@ -144,21 +245,63 @@ func buildLogger(cfg config.LogConfig) *slog.Logger {
 	return slog.New(handler)
 }
 
-// buildBilling 用配置构建计费门面，并返回其异步用量记录器（供优雅关闭时冲刷）。
-// sink 决定用量日志的落库目的地（PGSink 或 NopSink），由 buildDataLayer 选定。
-func buildBilling(cfg config.BillingConfig, rdb *redis.Client, sink billing.Sink) (*billing.Billing, *billing.Recorder) {
-	models := make(map[string]billing.ModelPrice, len(cfg.Models))
+// buildBilling 用价格与模型计费上界构建持久计费门面。
+func buildBilling(cfg config.BillingConfig, ledger billing.Ledger, strict bool) *billing.Billing {
+	models := make(map[string]billing.ModelPolicy, len(cfg.Models))
 	for _, m := range cfg.Models {
-		models[m.Model] = billing.ModelPrice{
-			InputPer1M:  m.InputPer1M,
-			OutputPer1M: m.OutputPer1M,
+		models[m.Model] = billing.ModelPolicy{
+			ModelPrice: billing.ModelPrice{
+				InputPer1M: m.InputPer1M, OutputPer1M: m.OutputPer1M,
+				CacheCreationInputPer1M: m.CacheCreationInputPer1M,
+				CacheReadInputPer1M:     m.CacheReadInputPer1M,
+			},
+			MaxBillableInputTokens: m.MaxBillableInputTokens,
+			MaxOutputTokens:        m.MaxOutputTokens,
 		}
 	}
-	pricing := billing.NewPricing(models, cfg.DefaultInputPer1M, cfg.DefaultOutputPer1M)
-	account := billing.NewAccount(rdb)
-	recorder := billing.NewRecorder(sink, billing.RecorderConfig{}, nil)
+	fallback := billing.ModelPolicy{
+		ModelPrice: billing.ModelPrice{
+			InputPer1M: cfg.DefaultInputPer1M, OutputPer1M: cfg.DefaultOutputPer1M,
+			CacheCreationInputPer1M: cfg.DefaultCacheCreationInputPer1M,
+			CacheReadInputPer1M:     cfg.DefaultCacheReadInputPer1M,
+		},
+		MaxBillableInputTokens: cfg.DefaultMaxBillableInputTokens,
+		MaxOutputTokens:        cfg.DefaultMaxOutputTokens,
+	}
+	pricing := billing.NewPricingWithPolicies(models, fallback)
+	if strict {
+		pricing = billing.NewStrictPricingWithPolicies(models, fallback)
+	}
+	return billing.New(pricing, ledger, cfg.DefaultReserve)
+}
 
-	return billing.New(pricing, account, recorder, cfg.DefaultReserve), recorder
+// startBillingRecovery 周期重试 consumed_unsettled，避免一次瞬时 PG 故障把用户
+// 预授权一直冻结到下次进程重启。过期 in_flight 只告警并等待人工对账。
+func startBillingRecovery(bill *billing.Billing, logger *slog.Logger) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				runCtx, runCancel := context.WithTimeout(ctx, 10*time.Second)
+				err := bill.Recover(runCtx)
+				runCancel()
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, billing.ErrAmbiguousReservations) {
+					logger.Warn("检测到过期 in_flight 预授权，需人工向对应 channel 对账", "err", err)
+				} else {
+					logger.Error("周期恢复未完成计费结算失败", "err", err)
+				}
+			}
+		}
+	}()
+	return cancel
 }
 
 // dataLayer 聚合数据访问层的装配产物。
@@ -167,7 +310,7 @@ type dataLayer struct {
 	adminStore admin.AdminStore      // 管理面数据访问（用户/密钥/渠道 CRUD）
 	account    account.AccountStore  // 控制台账户数据访问
 	settings   account.SettingsStore // 系统设置数据访问
-	sink       billing.Sink          // 用量日志落库目的地
+	ledger     billing.Ledger        // 权威预授权/结算账本
 	channels   []*routing.Channel    // 路由引擎初始渠道
 	pool       *pgxpool.Pool         // 非 nil 表示 PG 生效，随进程退出关闭
 }
@@ -175,14 +318,14 @@ type dataLayer struct {
 // buildDataLayer 装配数据访问层。
 //
 // 决策：database.enabled=true 时连 PostgreSQL——建池、（可选）自动建表、
-// 用 sqlc 查询装配 PGStore + PGSink + PG AdminStore，并从 channels 表加载启用渠道。
+// 用 sqlc 查询装配 PGStore + PGLedger + PG AdminStore，并从 channels 表加载启用渠道。
 // 连库失败视为致命（显式开启却连不上应尽早暴露）。
 // database.enabled=false 时回退配置驱动的内存实现：AdminStore 复用同一 MemoryStore
-// 实例（使管理面写入即时对热路径可见）+ NopSink + config 渠道（本地开发免装 DB）。
+// 实例（使管理面写入即时对热路径可见）+ MemoryLedger + config 渠道。
 // pool 为 nil 表示走内存分支，调用方无需关闭。
-func buildDataLayer(cfg *config.Config) dataLayer {
+func buildDataLayer(cfg *config.Config, channelKeys *admin.ChannelKeyCipher) dataLayer {
 	if !cfg.Database.Enabled {
-		log.Println("数据库未启用（database.enabled=false），使用内存 Store + 丢弃用量日志")
+		log.Println("数据库未启用（database.enabled=false），使用仅供开发的内存 Store + MemoryLedger")
 		mem := store.NewMemoryStore(buildKeySeeds(cfg.Auth))
 		adminChannels := configToAdminChannels(cfg.Channels)
 		accStore := account.NewMemoryStore(mem)
@@ -191,7 +334,7 @@ func buildDataLayer(cfg *config.Config) dataLayer {
 			adminStore: admin.NewMemoryStore(mem, adminChannels),
 			account:    accStore,
 			settings:   accStore,
-			sink:       billing.NopSink{},
+			ledger:     billing.NewMemoryLedger(mem),
 			channels:   forwarder.ChannelsFromConfig(cfg.Channels),
 			pool:       nil,
 		}
@@ -203,7 +346,7 @@ func buildDataLayer(cfg *config.Config) dataLayer {
 	pool, err := db.NewPool(ctx, db.PoolConfig{
 		DSN:             cfg.Database.DSN,
 		MaxConns:        int32(cfg.Database.MaxOpenConns),
-		MinConns:        int32(cfg.Database.MaxIdleConns),
+		MinConns:        int32(cfg.Database.MinIdleConns),
 		ConnMaxLifetime: time.Duration(cfg.Database.ConnMaxLifetime) * time.Second,
 	})
 	if err != nil {
@@ -215,34 +358,66 @@ func buildDataLayer(cfg *config.Config) dataLayer {
 			pool.Close()
 			log.Fatalf("应用数据库 schema 失败: %v", err)
 		}
-		log.Println("数据库 schema 已应用（auto_migrate=true）")
+		log.Println("数据库版本化迁移已应用（auto_migrate=true）")
+	} else if err := db.VerifySchema(ctx, pool); err != nil {
+		pool.Close()
+		log.Fatalf("数据库 schema 版本校验失败: %v", err)
 	}
 
 	q := db.New(pool)
+	migrated, err := admin.MigrateChannelAPIKeys(
+		ctx,
+		pool,
+		channelKeys,
+		cfg.Database.ChannelKeyEncryption.MigratePlaintext,
+	)
+	if err != nil {
+		pool.Close()
+		log.Fatalf("验证或迁移 PostgreSQL 渠道密钥失败: %v", err)
+	}
+	if migrated > 0 {
+		log.Printf("已在单个事务中加密迁移 %d 个历史渠道密钥；请立即关闭 migrate_plaintext", migrated)
+	}
+	if cfg.Database.AutoMigrate {
+		if err := db.ValidateChannelKeyEnvelopeConstraint(ctx, pool); err != nil {
+			pool.Close()
+			log.Fatalf("渠道密钥密文约束验证失败: %v", err)
+		}
+	}
+	adminStore := admin.NewPGStore(q, channelKeys)
 
-	// 从 channels 表加载启用渠道喂给路由引擎。
-	rows, err := q.ListEnabledChannels(ctx)
+	// 通过 PGStore 解密后再送入路由；SQL 原始密文不能越过此数据访问边界。
+	storedChannels, err := adminStore.ListChannels(ctx)
 	if err != nil {
 		pool.Close()
 		log.Fatalf("加载渠道失败: %v", err)
 	}
-	channels, err := forwarder.ChannelsFromDB(rows)
-	if err != nil {
-		pool.Close()
-		log.Fatalf("解析渠道配置失败: %v", err)
+	channels := make([]*routing.Channel, 0, len(storedChannels))
+	for _, ch := range admin.ChannelsToRouting(storedChannels) {
+		if ch.Enabled {
+			channels = append(channels, ch)
+		}
 	}
 
-	log.Println("数据库已启用，使用 PostgreSQL Store + 用量日志落库")
+	log.Println("数据库已启用，使用 PostgreSQL Store + 持久预授权账本")
 	accStore := account.NewPGStore(pool)
 	return dataLayer{
 		store:      store.NewPGStore(q),
-		adminStore: admin.NewPGStore(q),
+		adminStore: adminStore,
 		account:    accStore,
 		settings:   accStore,
-		sink:       billing.NewPGSink(q),
+		ledger:     billing.NewPostgresLedger(pool),
 		channels:   channels,
 		pool:       pool,
 	}
+}
+
+func channelKeyCipherForConfig(cfg *config.Config) (*admin.ChannelKeyCipher, error) {
+	if cfg == nil || !cfg.Database.Enabled {
+		return nil, nil
+	}
+	enc := cfg.Database.ChannelKeyEncryption
+	return admin.NewChannelKeyCipher(enc.KeyID, enc.Key)
 }
 
 // configToAdminChannels 把配置渠道转换为管理面渠道视图（内存模式的渠道初始集）。

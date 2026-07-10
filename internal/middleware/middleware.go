@@ -1,7 +1,7 @@
 // Package middleware 提供网关的 HTTP 中间件：鉴权、限流、额度检查。
 //
-// 三者按顺序挂在 /v1 分组上：Auth -> RateLimit -> Quota。
-// Auth 把调用方身份注入 gin.Context，后续中间件与业务处理器据此工作。
+// /v1 前置 Auth -> RateLimit；资金预授权必须在解析模型与输出上限后计算，
+// 因此由 Forwarder 在上游 I/O 前调用持久账本完成。
 package middleware
 
 import (
@@ -26,13 +26,9 @@ func IdentityFrom(c *gin.Context) (*store.Identity, bool) {
 	return id, ok
 }
 
-// abortError 以统一的 OpenAI 风格错误结构中止请求。
-// 网关对外错误格式对齐 OpenAI，便于客户端 SDK 直接消费。
+// abortError 按兼容端点的协议上下文中止请求；普通管理/认证端点未注入协议，
+// 继续使用历史 OpenAI 风格错误结构。
 func abortError(c *gin.Context, status int, errType, message string) {
-	c.AbortWithStatusJSON(status, gin.H{
-		"error": gin.H{
-			"message": message,
-			"type":    errType,
-		},
-	})
+	c.Abort()
+	WriteError(c, status, errType, message)
 }

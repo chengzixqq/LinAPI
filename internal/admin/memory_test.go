@@ -3,6 +3,9 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"linapi/internal/store"
@@ -141,6 +144,99 @@ func TestMemoryAPIKeyCRUD(t *testing.T) {
 	}
 	if err := m.DeleteAPIKey(ctx, "k1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("删除不存在密钥应 ErrNotFound, 得到 %v", err)
+	}
+}
+
+func TestMemoryStoreRejectsUnsafeRateLimit(t *testing.T) {
+	m := newMemStore()
+	ctx := context.Background()
+	if _, err := m.CreateUser(ctx, CreateUserInput{ExternalID: "u", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := m.CreateAPIKey(ctx, CreateAPIKeyInput{
+		APIKey: "sk", KeyID: "k", UserID: "u", RateLimitPerMin: MaxRateLimitPerMin + 1,
+	})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("超大限流值应被领域层拒绝，得到 %v", err)
+	}
+}
+
+func TestMemoryStoreKeyLimitIsAtomic(t *testing.T) {
+	m := newMemStore()
+	ctx := context.Background()
+	if _, err := m.CreateUser(ctx, CreateUserInput{ExternalID: "limited", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := m.CreateAPIKeyLimited(ctx, CreateAPIKeyInput{
+				APIKey: fmt.Sprintf("sk-%d", i), KeyID: fmt.Sprintf("k-%d", i),
+				UserID: "limited", RateLimitPerMin: 60, Enabled: true,
+			}, 3)
+			if err == nil {
+				successes.Add(1)
+			} else if !errors.Is(err, ErrLimitReached) {
+				t.Errorf("并发创建返回意外错误: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if got := successes.Load(); got != 3 {
+		t.Fatalf("并发创建成功数=%d, want 3", got)
+	}
+}
+
+func TestMemoryAPIKeyCreatedAtPersistsAcrossListAndToggle(t *testing.T) {
+	m := newMemStore()
+	ctx := context.Background()
+	if _, err := m.CreateUser(ctx, CreateUserInput{ExternalID: "u1", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := m.CreateAPIKey(ctx, CreateAPIKeyInput{
+		APIKey: "sk-created", KeyID: "k-created", UserID: "u1", Enabled: true,
+	})
+	if err != nil || created.CreatedAt.IsZero() {
+		t.Fatalf("创建密钥必须返回非零 created_at: %+v err=%v", created, err)
+	}
+	listed, err := m.ListAPIKeysByUser(ctx, "u1")
+	if err != nil || len(listed) != 1 || !listed[0].CreatedAt.Equal(created.CreatedAt) {
+		t.Fatalf("列表必须保留 created_at: %+v err=%v", listed, err)
+	}
+	toggled, err := m.SetAPIKeyEnabled(ctx, "k-created", false)
+	if err != nil || !toggled.CreatedAt.Equal(created.CreatedAt) {
+		t.Fatalf("启停密钥不得丢失 created_at: %+v err=%v", toggled, err)
+	}
+}
+
+func TestChannelInputRejectsOutOfRangePriorityAndWeight(t *testing.T) {
+	m := newMemStore()
+	base := ChannelInput{
+		ChannelID: "c1", Name: "channel", Format: "openai", BaseURL: "https://up.example",
+		APIKey: "sk-test", Models: map[string]string{"gpt-4o": ""}, Weight: 1,
+	}
+	for name, mutate := range map[string]func(*ChannelInput){
+		"priority too large": func(in *ChannelInput) { in.Priority = MaxChannelPriority + 1 },
+		"priority too small": func(in *ChannelInput) { in.Priority = MinChannelPriority - 1 },
+		"weight negative":    func(in *ChannelInput) { in.Weight = -1 },
+		"weight too large":   func(in *ChannelInput) { in.Weight = MaxChannelWeight + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			in := base
+			mutate(&in)
+			if _, err := m.CreateChannel(context.Background(), in); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("CreateChannel 应拒绝越界数值，得到 %v", err)
+			}
+		})
+	}
+	base.ChannelID = "c-default"
+	base.Weight = 0
+	created, err := m.CreateChannel(context.Background(), base)
+	if err != nil || created.Weight != 1 {
+		t.Fatalf("缺失 weight 应归一为 1: %+v err=%v", created, err)
 	}
 }
 

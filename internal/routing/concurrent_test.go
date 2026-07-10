@@ -31,12 +31,12 @@ func TestConcurrentSelectAndReport(t *testing.T) {
 					continue // 可能短暂全熔断
 				}
 				c := cands[0]
-				if c.Breaker.Allow() {
+				if permit, ok := c.Breaker.Allow(); ok {
 					// 交替上报成败，制造熔断/恢复翻转
 					if (seed+i)%4 == 0 {
-						c.Breaker.RecordFailure()
+						permit.RecordFailure()
 					} else {
-						c.Breaker.RecordSuccess()
+						permit.RecordSuccess()
 					}
 				}
 			}

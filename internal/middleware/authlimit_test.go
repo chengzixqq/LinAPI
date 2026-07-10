@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -92,6 +93,34 @@ func TestIPRateLimiterFailOpenOnRedisDown(t *testing.T) {
 	}
 }
 
+func TestIdentifierRateLimiterNormalizesScopesAndHashesUsername(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	rl := NewIdentifierRateLimiter(rdb, "credential", 2)
+
+	for _, username := range []string{" Alice ", "alice"} {
+		allowed, _, err := rl.Allow(context.Background(), "login", username)
+		if err != nil || !allowed {
+			t.Fatalf("前两次归一化标识应放行: allowed=%v err=%v", allowed, err)
+		}
+	}
+	allowed, retryAfter, err := rl.Allow(context.Background(), "login", "ALICE")
+	if err != nil || allowed || retryAfter <= 0 {
+		t.Fatalf("同一归一化登录名应共享预算: allowed=%v retry=%d err=%v", allowed, retryAfter, err)
+	}
+	// register 与 login 分桶，避免注册洪泛直接锁死同名账户登录。
+	allowed, _, err = rl.Allow(context.Background(), "register", "alice")
+	if err != nil || !allowed {
+		t.Fatalf("不同认证端点应使用独立预算: allowed=%v err=%v", allowed, err)
+	}
+	for _, key := range mr.Keys() {
+		if strings.Contains(strings.ToLower(key), "alice") {
+			t.Fatalf("Redis key 不得泄露登录名: %q", key)
+		}
+	}
+}
+
 // TestBcryptSemaphoreLimitsConcurrency 验证 bcrypt 并发信号量把在途 goroutine 数
 // 卡在容量以内：占满后再 Acquire 必须阻塞，直到有 Release。防匿名并发登录把 bcrypt
 // goroutine 撑到无界、耗尽 CPU。
@@ -117,6 +146,24 @@ func TestBcryptSemaphoreLimitsConcurrency(t *testing.T) {
 	sem.Release()
 	if !sem.Acquire(context.Background()) {
 		t.Fatal("释放后 Acquire 应成功")
+	}
+}
+
+func TestBcryptSemaphoreTryAcquireDoesNotQueue(t *testing.T) {
+	sem := NewSemaphore(1)
+	if !sem.TryAcquire() {
+		t.Fatal("空闲槽应立即获取成功")
+	}
+	start := time.Now()
+	if sem.TryAcquire() {
+		t.Fatal("容量已满时 TryAcquire 应立即失败")
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("TryAcquire 不应排队，耗时 %s", elapsed)
+	}
+	sem.Release()
+	if !sem.TryAcquire() {
+		t.Fatal("释放后应可再次获取")
 	}
 }
 

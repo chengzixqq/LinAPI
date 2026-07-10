@@ -181,7 +181,7 @@ UPDATE channels
 SET name = $2,
     format = $3,
     base_url = $4,
-    api_key = $5,
+    api_key = CASE WHEN $10 THEN $5 ELSE api_key END,
     models = $6,
     priority = $7,
     weight = $8,
@@ -202,6 +202,7 @@ type UpdateChannelParams struct {
 	Priority  int32  `json:"priority"`
 	Weight    int32  `json:"weight"`
 	Enabled   bool   `json:"enabled"`
+	ApiKeySet bool   `json:"api_key_set"`
 }
 
 // UpdateChannel 全量更新渠道，返回更新后的行。
@@ -216,6 +217,7 @@ func (q *Queries) UpdateChannel(ctx context.Context, arg UpdateChannelParams) (C
 		arg.Priority,
 		arg.Weight,
 		arg.Enabled,
+		arg.ApiKeySet,
 	)
 	var i Channel
 	err := row.Scan(

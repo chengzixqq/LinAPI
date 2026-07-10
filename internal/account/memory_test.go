@@ -69,6 +69,9 @@ func TestMemoryCreateAdminAccount(t *testing.T) {
 	if _, err := m.CreateAccount(ctx, CreateAccountInput{Username: "x", Role: "bogus"}); !errors.Is(err, ErrInvalidRole) {
 		t.Fatalf("非法角色应 ErrInvalidRole, 得到 %v", err)
 	}
+	if _, err := m.CreateAccount(ctx, CreateAccountInput{Username: "user", Role: RoleUser, ExternalID: "user"}); !errors.Is(err, ErrInvalidRole) {
+		t.Fatalf("user 不得绕过 CreateUserAccount，得到 %v", err)
+	}
 }
 
 func TestMemorySetEnabledAndPassword(t *testing.T) {

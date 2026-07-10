@@ -33,7 +33,7 @@ func newAuthTestEngine(t *testing.T) (*gin.Engine, account.AccountStore, *sessio
 	sess := session.NewManager(rdb)
 
 	accStore := account.NewMemoryStore(store.NewMemoryStore(nil))
-	h := newAuthHandlers(accStore, accStore, sess, false, nil)
+	h := newAuthHandlers(accStore, accStore, sess, false, nil, nil)
 
 	// 会话代次校验（审查 AUD-P1-17）：logout/me 走带代次的鉴权，账户禁用/改密后旧会话立即失效。
 	verChecker := middleware.SessionVersionCheckerFunc(func(ctx context.Context, id int64) (int, error) {
@@ -93,6 +93,27 @@ func TestRegisterWhenEnabledThenLogin(t *testing.T) {
 	}
 }
 
+func TestRegisterDoesNotRevealExistingUsername(t *testing.T) {
+	e, accStore, _ := newAuthTestEngine(t)
+	_ = accStore.(*account.MemoryStore).Put(context.Background(), account.Settings{RegistrationEnabled: true})
+	body, _ := json.Marshal(gin.H{"username": "same", "password": "password123"})
+
+	responses := make([]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/auth/register", bytesReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		e.ServeHTTP(w, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("第 %d 次注册 status=%d body=%s", i+1, w.Code, w.Body.String())
+		}
+		responses = append(responses, w.Body.String())
+	}
+	if responses[0] != responses[1] {
+		t.Fatalf("成功与用户名冲突响应必须一致: %q != %q", responses[0], responses[1])
+	}
+}
+
 // TestRegisterGrantsNoBalance 验证自助注册恒不发放额度（审查 AUD-P0-07）：
 // 即便系统设置里被注入正的 new_user_initial_balance（模拟脏配置 / 旧数据 /
 // 绕过 putSettings 校验的直接 DB 写入），注册出来的账户余额也必须为 0——
@@ -106,7 +127,7 @@ func TestRegisterGrantsNoBalance(t *testing.T) {
 
 	base := store.NewMemoryStore(nil)
 	accStore := account.NewMemoryStore(base)
-	h := newAuthHandlers(accStore, accStore, sess, false, nil)
+	h := newAuthHandlers(accStore, accStore, sess, false, nil, nil)
 
 	// 直接注入正初始额度，绕过 putSettings 校验，坐实“决定性修复”而非仅靠设置层拦截。
 	_ = accStore.Put(context.Background(), account.Settings{
@@ -153,6 +174,38 @@ func TestLoginWrongPassword(t *testing.T) {
 	}
 }
 
+func TestLoginIdentifierBudgetRunsBeforeAccountLookupAndBcrypt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	accStore := account.NewMemoryStore(store.NewMemoryStore(nil))
+	h := newAuthHandlers(
+		accStore, accStore, session.NewManager(rdb), false, nil,
+		middleware.NewIdentifierRateLimiter(rdb, "test-credential", 1),
+	)
+	e := gin.New()
+	e.POST("/auth/login", h.login)
+
+	request := func(username string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(gin.H{"username": username, "password": "wrongpass"})
+		req := httptest.NewRequest(http.MethodPost, "/auth/login", bytesReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		e.ServeHTTP(w, req)
+		return w
+	}
+	if got := request("missing-user").Code; got != http.StatusUnauthorized {
+		t.Fatalf("首次错误登录应维持统一 401，得到 %d", got)
+	}
+	if w := request(" MISSING-USER "); w.Code != http.StatusTooManyRequests || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("同一归一化登录名超配额应在查账户/bcrypt 前 429，status=%d retry=%q", w.Code, w.Header().Get("Retry-After"))
+	}
+	if got := request("other-user").Code; got != http.StatusUnauthorized {
+		t.Fatalf("不同登录名不应共享预算，得到 %d", got)
+	}
+}
+
 func TestLoginCookieAttributes(t *testing.T) {
 	e, accStore, _ := newAuthTestEngine(t)
 	hash, _ := account.HashPassword("password123")
@@ -190,9 +243,7 @@ func TestLoginCookieAttributes(t *testing.T) {
 func TestLoginDisabledAccount(t *testing.T) {
 	e, accStore, _ := newAuthTestEngine(t)
 	hash, _ := account.HashPassword("password123")
-	acc, err := accStore.CreateAccount(context.Background(), account.CreateAccountInput{
-		Username: "eve", PasswordHash: hash, Role: account.RoleUser,
-	})
+	acc, err := accStore.CreateUserAccount(context.Background(), "eve", hash, 0)
 	if err != nil {
 		t.Fatalf("建账户失败: %v", err)
 	}
@@ -262,7 +313,7 @@ func TestLogoutFailsWhenSessionDeleteFails(t *testing.T) {
 	t.Cleanup(func() { _ = rdb.Close() })
 	sess := session.NewManager(rdb)
 	accStore := account.NewMemoryStore(store.NewMemoryStore(nil))
-	h := newAuthHandlers(accStore, accStore, sess, false, nil)
+	h := newAuthHandlers(accStore, accStore, sess, false, nil, nil)
 
 	// 先建一个真实会话拿到 token。
 	token, err := sess.Create(context.Background(), session.SessionData{
@@ -302,9 +353,7 @@ func TestLogoutFailsWhenSessionDeleteFails(t *testing.T) {
 func TestDisableAccountRevokesExistingSession(t *testing.T) {
 	e, accStore, _ := newAuthTestEngine(t)
 	hash, _ := account.HashPassword("password123")
-	acc, err := accStore.CreateAccount(context.Background(), account.CreateAccountInput{
-		Username: "grace", PasswordHash: hash, Role: account.RoleUser,
-	})
+	acc, err := accStore.CreateUserAccount(context.Background(), "grace", hash, 0)
 	if err != nil {
 		t.Fatalf("建账户失败: %v", err)
 	}
@@ -353,9 +402,7 @@ func TestDisableAccountRevokesExistingSession(t *testing.T) {
 func TestPasswordResetRevokesExistingSession(t *testing.T) {
 	e, accStore, _ := newAuthTestEngine(t)
 	hash, _ := account.HashPassword("password123")
-	acc, err := accStore.CreateAccount(context.Background(), account.CreateAccountInput{
-		Username: "heidi", PasswordHash: hash, Role: account.RoleUser,
-	})
+	acc, err := accStore.CreateUserAccount(context.Background(), "heidi", hash, 0)
 	if err != nil {
 		t.Fatalf("建账户失败: %v", err)
 	}
@@ -546,5 +593,3 @@ func TestCSRFProtectsMeWrites(t *testing.T) {
 		t.Fatalf("缺 CSRF token 的写请求应被拦为 403, 得到 %d; body=%s", w.Code, w.Body.String())
 	}
 }
-
-

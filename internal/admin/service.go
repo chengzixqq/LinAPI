@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"linapi/internal/routing"
@@ -13,21 +14,30 @@ import (
 // 与 router 通过 *routing.Router 直连（同进程）。多实例部署时，其它实例
 // 依赖定时热重载（见 server 装配的 reload goroutine）收敛渠道变更。
 type Service struct {
-	store  AdminStore
-	router *routing.Router // 可为 nil（无路由的场景，如纯用户/密钥管理测试）
-	logger *slog.Logger
+	store           AdminStore
+	router          *routing.Router // 可为 nil（无路由的场景，如纯用户/密钥管理测试）
+	logger          *slog.Logger
+	validateChannel func(*routing.Channel) error
 }
 
 // NewService 构建管理服务。router 为 nil 时渠道写操作仍落库，只是不触发热更新。
 func NewService(store AdminStore, router *routing.Router, logger *slog.Logger) *Service {
+	return NewServiceWithChannelValidator(store, router, logger, nil)
+}
+
+func NewServiceWithChannelValidator(store AdminStore, router *routing.Router, logger *slog.Logger, validator func(*routing.Channel) error) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{store: store, router: router, logger: logger}
+	return &Service{store: store, router: router, logger: logger, validateChannel: validator}
 }
 
 // Store 暴露底层 AdminStore，供只读 handler 直接使用。
 func (s *Service) Store() AdminStore { return s.store }
+
+func (s *Service) CreateAPIKeyLimited(ctx context.Context, in CreateAPIKeyInput, maxKeys int) (APIKey, error) {
+	return s.store.CreateAPIKeyLimited(ctx, in, maxKeys)
+}
 
 // ReloadChannels 从存储全量拉取渠道并原子替换到路由引擎。
 // 渠道写操作后调用；也供定时热重载复用。router 为 nil 时为空操作。
@@ -39,7 +49,11 @@ func (s *Service) ReloadChannels(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	s.router.UpdateChannels(ChannelsToRouting(channels))
+	routingChannels := ChannelsToRouting(channels)
+	if err := s.validateChannels(routingChannels); err != nil {
+		return err
+	}
+	s.router.UpdateChannels(routingChannels)
 	s.logger.Info("路由渠道已热更新", "count", len(channels))
 	return nil
 }
@@ -48,6 +62,9 @@ func (s *Service) ReloadChannels(ctx context.Context) error {
 
 // CreateChannel 新建渠道并热更新路由。
 func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (Channel, error) {
+	if err := s.validateInput(in); err != nil {
+		return Channel{}, err
+	}
 	ch, err := s.store.CreateChannel(ctx, in)
 	if err != nil {
 		return Channel{}, err
@@ -58,6 +75,16 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (Channel, 
 
 // UpdateChannel 全量更新渠道并热更新路由。
 func (s *Service) UpdateChannel(ctx context.Context, in ChannelInput) (Channel, error) {
+	if !in.APIKeySet && in.APIKey == "" {
+		current, err := s.store.GetChannel(ctx, in.ChannelID)
+		if err != nil {
+			return Channel{}, err
+		}
+		in.APIKey = current.APIKey
+	}
+	if err := s.validateInput(in); err != nil {
+		return Channel{}, err
+	}
 	ch, err := s.store.UpdateChannel(ctx, in)
 	if err != nil {
 		return Channel{}, err
@@ -66,8 +93,37 @@ func (s *Service) UpdateChannel(ctx context.Context, in ChannelInput) (Channel, 
 	return ch, nil
 }
 
+func (s *Service) validateInput(in ChannelInput) error {
+	return s.validateChannels([]*routing.Channel{ChannelToRouting(Channel{
+		ChannelID: in.ChannelID, Name: in.Name, Format: in.Format, BaseURL: in.BaseURL,
+		APIKey: in.APIKey, Models: in.Models, Priority: in.Priority, Weight: in.Weight, Enabled: in.Enabled,
+	})})
+}
+
+func (s *Service) validateChannels(channels []*routing.Channel) error {
+	if s.validateChannel == nil {
+		return nil
+	}
+	for _, ch := range channels {
+		if err := s.validateChannel(ch); err != nil {
+			return fmt.Errorf("渠道 %q 安全策略校验失败: %w", ch.ID, err)
+		}
+	}
+	return nil
+}
+
 // SetChannelEnabled 启停渠道并热更新路由。
 func (s *Service) SetChannelEnabled(ctx context.Context, channelID string, enabled bool) (Channel, error) {
+	if enabled && s.validateChannel != nil {
+		current, err := s.store.GetChannel(ctx, channelID)
+		if err != nil {
+			return Channel{}, err
+		}
+		current.Enabled = true
+		if err := s.validateChannels([]*routing.Channel{ChannelToRouting(current)}); err != nil {
+			return Channel{}, err
+		}
+	}
 	ch, err := s.store.SetChannelEnabled(ctx, channelID, enabled)
 	if err != nil {
 		return Channel{}, err

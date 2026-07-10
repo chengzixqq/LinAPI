@@ -43,6 +43,13 @@ type Adapter interface {
 	NewStreamEncoder() StreamEncoder
 }
 
+// ErrorCodec 把供应商 HTTP 错误体与规范错误双向转换。它与 Adapter 分开定义，
+// 使第三方适配器可以渐进接入；内置适配器均实现该接口。
+type ErrorCodec interface {
+	ParseError(raw []byte) (*canonical.ErrorResponse, error)
+	BuildError(err *canonical.ErrorResponse) ([]byte, error)
+}
+
 // StreamDecoder 把供应商 SSE 的原始数据块流解析为规范事件。
 // 有状态、非并发安全：每个流式请求独占一个实例。
 type StreamDecoder interface {

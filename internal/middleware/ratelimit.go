@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
@@ -16,8 +15,7 @@ import (
 // KEYS[1]           = 桶的 key
 // ARGV[1] capacity  = 桶容量（每分钟允许的请求数）
 // ARGV[2] refill    = 每秒补充的令牌数（capacity/60）
-// ARGV[3] now       = 当前时间（秒，浮点）
-// ARGV[4] requested = 本次请求消耗的令牌数（通常为 1）
+// ARGV[3] requested = 本次请求消耗的令牌数（通常为 1）
 //
 // 返回：{allowed(1/0), remaining(取整), retry_after_seconds(取整向上)}
 //
@@ -27,8 +25,9 @@ const tokenBucketScript = `
 local key = KEYS[1]
 local capacity = tonumber(ARGV[1])
 local refill = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
-local requested = tonumber(ARGV[4])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+local requested = tonumber(ARGV[3])
 
 local bucket = redis.call('HMGET', key, 'tokens', 'ts')
 local tokens = tonumber(bucket[1])
@@ -90,7 +89,7 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 			return
 		}
 
-		allowed, remaining, retryAfter, err := rl.allow(c.Request.Context(), id.KeyID, id.RateLimitPerMin)
+		allowed, remaining, retryAfter, err := rl.allow(c.Request.Context(), "key:"+id.KeyID, id.RateLimitPerMin)
 		if err != nil {
 			// Redis 故障时的取舍：放行而非拦截（fail-open），避免限流组件抖动
 			// 直接打挂整个网关；额度中间件仍会兜住余额。
@@ -111,15 +110,43 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	}
 }
 
+// AccountMiddleware 在单 Key 限流外增加账户级总预算，防止用户创建多把 Key 线性叠加
+// 平台吞吐。应挂在 Auth 之后、单 Key RateLimiter 之前。
+func (rl *RateLimiter) AccountMiddleware(perMin int) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if perMin <= 0 {
+			c.Next()
+			return
+		}
+		id, ok := IdentityFrom(c)
+		if !ok {
+			abortError(c, http.StatusUnauthorized, "authentication_error", "未鉴权")
+			return
+		}
+		allowed, remaining, retryAfter, err := rl.allow(c.Request.Context(), "account:"+id.UserID, perMin)
+		if err != nil {
+			c.Next()
+			return
+		}
+		c.Header("X-Account-RateLimit-Limit", strconv.Itoa(perMin))
+		c.Header("X-Account-RateLimit-Remaining", strconv.Itoa(remaining))
+		if !allowed {
+			c.Header("Retry-After", strconv.Itoa(retryAfter))
+			abortError(c, http.StatusTooManyRequests, "rate_limit_error", "账户请求过于频繁，请稍后重试")
+			return
+		}
+		c.Next()
+	}
+}
+
 // allow 执行一次令牌桶判定。
-func (rl *RateLimiter) allow(ctx context.Context, keyID string, perMin int) (allowed bool, remaining, retryAfter int, err error) {
+func (rl *RateLimiter) allow(ctx context.Context, bucketID string, perMin int) (allowed bool, remaining, retryAfter int, err error) {
 	capacity := float64(perMin)
 	refill := capacity / 60.0
-	now := float64(time.Now().UnixNano()) / 1e9
 
-	bucketKey := "ratelimit:" + keyID
+	bucketKey := "ratelimit:" + bucketID
 	res, err := rl.script.Run(ctx, rl.rdb, []string{bucketKey},
-		capacity, refill, now, 1).Int64Slice()
+		capacity, refill, 1).Int64Slice()
 	if err != nil {
 		return false, 0, 0, err
 	}

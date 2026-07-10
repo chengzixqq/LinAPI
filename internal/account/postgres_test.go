@@ -15,7 +15,8 @@ import (
 type fakeQuerier struct {
 	db.Querier
 	getByUsernameFn  func(ctx context.Context, u string) (db.Account, error)
-	getSettingFn     func(ctx context.Context, k string) (db.Setting, error)
+	getSettingsFn    func(ctx context.Context) (db.GetSettingsSnapshotRow, error)
+	putSettingsFn    func(ctx context.Context, arg db.UpsertSettingsSnapshotParams) error
 	getByIDFn        func(ctx context.Context, id int64) (db.Account, error)
 	updatePasswordFn func(ctx context.Context, arg db.UpdateAccountPasswordParams) error
 }
@@ -23,8 +24,11 @@ type fakeQuerier struct {
 func (f *fakeQuerier) GetAccountByUsername(ctx context.Context, u string) (db.Account, error) {
 	return f.getByUsernameFn(ctx, u)
 }
-func (f *fakeQuerier) GetSetting(ctx context.Context, k string) (db.Setting, error) {
-	return f.getSettingFn(ctx, k)
+func (f *fakeQuerier) GetSettingsSnapshot(ctx context.Context) (db.GetSettingsSnapshotRow, error) {
+	return f.getSettingsFn(ctx)
+}
+func (f *fakeQuerier) UpsertSettingsSnapshot(ctx context.Context, arg db.UpsertSettingsSnapshotParams) error {
+	return f.putSettingsFn(ctx, arg)
 }
 func (f *fakeQuerier) GetAccountByID(ctx context.Context, id int64) (db.Account, error) {
 	return f.getByIDFn(ctx, id)
@@ -60,11 +64,21 @@ func TestPGGetCredentials(t *testing.T) {
 	}
 }
 
+func TestPGCreateAccountRejectsDirectUser(t *testing.T) {
+	s := &PGStore{q: &fakeQuerier{}}
+	_, err := s.CreateAccount(context.Background(), CreateAccountInput{
+		Username: "user", Role: RoleUser, ExternalID: "user",
+	})
+	if !errors.Is(err, ErrInvalidRole) {
+		t.Fatalf("user 不得绕过 CreateUserAccount，得到 %v", err)
+	}
+}
+
 func TestPGGetSettingsDefaults(t *testing.T) {
 	ctx := context.Background()
 	q := &fakeQuerier{
-		getSettingFn: func(_ context.Context, _ string) (db.Setting, error) {
-			return db.Setting{}, pgx.ErrNoRows // 键缺失 -> 回退默认。
+		getSettingsFn: func(_ context.Context) (db.GetSettingsSnapshotRow, error) {
+			return db.GetSettingsSnapshotRow{}, nil // 空值 -> 回退默认。
 		},
 	}
 	s := &PGStore{q: q}

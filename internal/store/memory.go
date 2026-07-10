@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"errors"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -35,6 +37,7 @@ type MemoryStore struct {
 type memUser struct {
 	enabled   bool
 	createdAt time.Time
+	updatedAt time.Time
 }
 
 // KeySeed 描述一个预置密钥，用于从配置构建 MemoryStore。
@@ -58,12 +61,22 @@ func NewMemoryStore(seeds []KeySeed) *MemoryStore {
 		users:    make(map[string]*memUser),
 	}
 	for _, seed := range seeds {
+		if _, exists := s.keys[seed.APIKey]; exists {
+			panic("store: 配置中存在重复 API Key")
+		}
+		if seed.KeyID != "" {
+			if _, exists := s.keyByID[seed.KeyID]; exists {
+				panic("store: 配置中存在重复 key_id: " + seed.KeyID)
+			}
+		}
+		now := time.Now()
 		id := &Identity{
 			KeyID:           seed.KeyID,
 			UserID:          seed.UserID,
 			RateLimitPerMin: seed.RateLimitPerMin,
 			AllowedModels:   seed.AllowedModels,
 			Enabled:         seed.Enabled,
+			CreatedAt:       now,
 		}
 		s.keys[seed.APIKey] = id
 		if seed.KeyID != "" {
@@ -72,7 +85,7 @@ func NewMemoryStore(seeds []KeySeed) *MemoryStore {
 		// 同一用户仅初始化一次余额与元数据。
 		if _, ok := s.users[seed.UserID]; !ok {
 			s.balances[seed.UserID] = seed.InitialBalance
-			s.users[seed.UserID] = &memUser{enabled: true, createdAt: time.Now()}
+			s.users[seed.UserID] = &memUser{enabled: true, createdAt: now, updatedAt: now}
 		}
 	}
 	return s
@@ -103,13 +116,56 @@ func (s *MemoryStore) Balance(_ context.Context, userID string) (int64, error) {
 	return s.balances[userID], nil
 }
 
-// AddBalance 原子增减某用户余额并返回增减后的值，供计费模块过渡期使用。
-// delta 为负表示扣费。
-func (s *MemoryStore) AddBalance(userID string, delta int64) int64 {
+// AddBalance 原子增减某用户余额并拒绝 int64 回绕。delta 为负表示扣费。
+func (s *MemoryStore) AddBalance(userID string, delta int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.balances[userID] += delta
-	return s.balances[userID]
+	bal, err := checkedBalanceAdd(s.balances[userID], delta)
+	if err != nil {
+		return s.balances[userID], err
+	}
+	s.balances[userID] = bal
+	if u := s.users[userID]; u != nil {
+		u.updatedAt = time.Now()
+	}
+	return bal, nil
+}
+
+// BillingReserve 为内存账本原子冻结一笔余额。仅供 database.enabled=false 的
+// 开发模式使用；生产资金路径由 PostgreSQL 事务账本实现。
+func (s *MemoryStore) BillingReserve(userID string, amount int64) (bool, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if amount < 0 {
+		return false, 0, ErrBalanceOverflow
+	}
+	u, ok := s.users[userID]
+	if !ok || !u.enabled {
+		return false, 0, ErrUserNotFound
+	}
+	bal := s.balances[userID]
+	if bal < amount {
+		return false, bal, nil
+	}
+	bal -= amount
+	s.balances[userID] = bal
+	return true, bal, nil
+}
+
+// BillingAdjust 为内存账本原子应用结算/退款差额并拒绝 int64 回绕。
+func (s *MemoryStore) BillingAdjust(userID string, delta int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.users[userID]; !ok {
+		return 0, ErrUserNotFound
+	}
+	bal := s.balances[userID]
+	bal, err := checkedBalanceAdd(bal, delta)
+	if err != nil {
+		return 0, err
+	}
+	s.balances[userID] = bal
+	return bal, nil
 }
 
 // ---- 管理操作 ----
@@ -120,9 +176,10 @@ func (s *MemoryStore) AddBalance(userID string, delta int64) int64 {
 
 // ErrUserExists / ErrUserNotFound / ErrKeyExists 是管理操作的 sentinel。
 var (
-	ErrUserExists   = errUserExists
-	ErrUserNotFound = errUserNotFound
-	ErrKeyExists    = errKeyExists
+	ErrUserExists      = errUserExists
+	ErrUserNotFound    = errUserNotFound
+	ErrKeyExists       = errKeyExists
+	ErrBalanceOverflow = errors.New("store: 余额算术溢出")
 )
 
 // MemUserView 是管理面读取用户的中性视图（不引入跨包类型依赖）。
@@ -131,6 +188,7 @@ type MemUserView struct {
 	Balance    int64
 	Enabled    bool
 	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // MemKeyView 是管理面读取密钥的中性视图。
@@ -151,9 +209,9 @@ func (s *MemoryStore) AdminCreateUser(externalID string, balance int64, enabled 
 		return MemUserView{}, errUserExists
 	}
 	now := time.Now()
-	s.users[externalID] = &memUser{enabled: enabled, createdAt: now}
+	s.users[externalID] = &memUser{enabled: enabled, createdAt: now, updatedAt: now}
 	s.balances[externalID] = balance
-	return MemUserView{ExternalID: externalID, Balance: balance, Enabled: enabled, CreatedAt: now}, nil
+	return MemUserView{ExternalID: externalID, Balance: balance, Enabled: enabled, CreatedAt: now, UpdatedAt: now}, nil
 }
 
 // AdminListUsers 分页列出用户（按创建时间倒序）。
@@ -163,7 +221,8 @@ func (s *MemoryStore) AdminListUsers(limit, offset int) []MemUserView {
 	views := make([]MemUserView, 0, len(s.users))
 	for id, u := range s.users {
 		views = append(views, MemUserView{
-			ExternalID: id, Balance: s.balances[id], Enabled: u.enabled, CreatedAt: u.createdAt,
+			ExternalID: id, Balance: s.balances[id], Enabled: u.enabled,
+			CreatedAt: u.createdAt, UpdatedAt: u.updatedAt,
 		})
 	}
 	sort.Slice(views, func(i, j int) bool {
@@ -183,7 +242,7 @@ func (s *MemoryStore) AdminGetUser(externalID string) (MemUserView, error) {
 	if !ok {
 		return MemUserView{}, errUserNotFound
 	}
-	return MemUserView{ExternalID: externalID, Balance: s.balances[externalID], Enabled: u.enabled, CreatedAt: u.createdAt}, nil
+	return MemUserView{ExternalID: externalID, Balance: s.balances[externalID], Enabled: u.enabled, CreatedAt: u.createdAt, UpdatedAt: u.updatedAt}, nil
 }
 
 // AdminSetUserEnabled 启停用户；不存在返回 ErrUserNotFound。
@@ -195,7 +254,8 @@ func (s *MemoryStore) AdminSetUserEnabled(externalID string, enabled bool) (MemU
 		return MemUserView{}, errUserNotFound
 	}
 	u.enabled = enabled
-	return MemUserView{ExternalID: externalID, Balance: s.balances[externalID], Enabled: u.enabled, CreatedAt: u.createdAt}, nil
+	u.updatedAt = time.Now()
+	return MemUserView{ExternalID: externalID, Balance: s.balances[externalID], Enabled: u.enabled, CreatedAt: u.createdAt, UpdatedAt: u.updatedAt}, nil
 }
 
 // AdminAddBalance 充值/扣减用户余额并返回新值；用户不存在返回 ErrUserNotFound。
@@ -205,32 +265,73 @@ func (s *MemoryStore) AdminAddBalance(externalID string, delta int64) (int64, er
 	if _, ok := s.users[externalID]; !ok {
 		return 0, errUserNotFound
 	}
-	s.balances[externalID] += delta
-	return s.balances[externalID], nil
+	bal, err := checkedBalanceAdd(s.balances[externalID], delta)
+	if err != nil {
+		return 0, err
+	}
+	s.balances[externalID] = bal
+	s.users[externalID].updatedAt = time.Now()
+	return bal, nil
+}
+
+func checkedBalanceAdd(balance, delta int64) (int64, error) {
+	if (delta > 0 && balance > math.MaxInt64-delta) ||
+		(delta < 0 && balance < math.MinInt64-delta) {
+		return 0, ErrBalanceOverflow
+	}
+	return balance + delta, nil
 }
 
 // AdminCreateKey 新建密钥；key_id 重复返回 ErrKeyExists，用户不存在返回 ErrUserNotFound。
 func (s *MemoryStore) AdminCreateKey(apiKey, keyID, userID string, rateLimit int, allowedModels []string, enabled bool) (MemKeyView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.adminCreateKeyLocked(apiKey, keyID, userID, rateLimit, allowedModels, enabled)
+}
+
+// AdminCreateKeyLimited 在同一把锁内完成计数与创建，避免并发请求同时越过上限。
+func (s *MemoryStore) AdminCreateKeyLimited(apiKey, keyID, userID string, rateLimit int, allowedModels []string, enabled bool, maxKeys int) (MemKeyView, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if maxKeys > 0 {
+		count := 0
+		for _, id := range s.keyByID {
+			if id.UserID == userID {
+				count++
+			}
+		}
+		if count >= maxKeys {
+			return MemKeyView{}, false, nil
+		}
+	}
+	view, err := s.adminCreateKeyLocked(apiKey, keyID, userID, rateLimit, allowedModels, enabled)
+	return view, err == nil, err
+}
+
+func (s *MemoryStore) adminCreateKeyLocked(apiKey, keyID, userID string, rateLimit int, allowedModels []string, enabled bool) (MemKeyView, error) {
 	if _, ok := s.users[userID]; !ok {
 		return MemKeyView{}, errUserNotFound
 	}
 	if _, ok := s.keyByID[keyID]; ok {
 		return MemKeyView{}, errKeyExists
 	}
+	if _, ok := s.keys[apiKey]; ok {
+		return MemKeyView{}, errKeyExists
+	}
+	now := time.Now()
 	id := &Identity{
 		KeyID:           keyID,
 		UserID:          userID,
 		RateLimitPerMin: rateLimit,
 		AllowedModels:   allowedModels,
 		Enabled:         enabled,
+		CreatedAt:       now,
 	}
 	s.keys[apiKey] = id
 	s.keyByID[keyID] = id
 	return MemKeyView{
 		KeyID: keyID, UserID: userID, RateLimitPerMin: rateLimit,
-		AllowedModels: allowedModels, Enabled: enabled, CreatedAt: time.Now(),
+		AllowedModels: allowedModels, Enabled: enabled, CreatedAt: now,
 	}, nil
 }
 
@@ -245,7 +346,7 @@ func (s *MemoryStore) AdminListKeysByUser(userID string) []MemKeyView {
 		}
 		views = append(views, MemKeyView{
 			KeyID: id.KeyID, UserID: id.UserID, RateLimitPerMin: id.RateLimitPerMin,
-			AllowedModels: id.AllowedModels, Enabled: id.Enabled,
+			AllowedModels: id.AllowedModels, Enabled: id.Enabled, CreatedAt: id.CreatedAt,
 		})
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].KeyID < views[j].KeyID })
@@ -263,7 +364,7 @@ func (s *MemoryStore) AdminSetKeyEnabled(keyID string, enabled bool) (MemKeyView
 	id.Enabled = enabled
 	return MemKeyView{
 		KeyID: id.KeyID, UserID: id.UserID, RateLimitPerMin: id.RateLimitPerMin,
-		AllowedModels: id.AllowedModels, Enabled: id.Enabled,
+		AllowedModels: id.AllowedModels, Enabled: id.Enabled, CreatedAt: id.CreatedAt,
 	}, nil
 }
 

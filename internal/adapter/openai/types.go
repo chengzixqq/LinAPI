@@ -6,21 +6,57 @@
 // 结构。因此入向需要“展开”，出向需要“折叠”。
 package openai
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
 // ---- OpenAI 线格式结构 ----
 
 // chatRequest 对应 POST /v1/chat/completions 的请求体。
 type chatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Tools       []tool        `json:"tools,omitempty"`
-	ToolChoice  any           `json:"tool_choice,omitempty"` // "auto"|"none"|"required"|{type,function}
-	MaxTokens   *int          `json:"max_tokens,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	TopP        *float64      `json:"top_p,omitempty"`
-	Stop        []string      `json:"stop,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
+	Model      string        `json:"model"`
+	Messages   []chatMessage `json:"messages"`
+	Tools      []tool        `json:"tools,omitempty"`
+	ToolChoice any           `json:"tool_choice,omitempty"` // "auto"|"none"|"required"|{type,function}
+	MaxTokens  *int          `json:"max_tokens,omitempty"`
+	N          *int          `json:"n,omitempty"`
+	// MaxCompletionTokens 是新模型使用的输出上限字段。入向解析时与
+	// max_tokens 归一到 canonical.MaxTokens；出向仍统一写 max_tokens。
+	MaxCompletionTokens *int          `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64      `json:"temperature,omitempty"`
+	TopP                *float64      `json:"top_p,omitempty"`
+	Stop                stopSequences `json:"stop,omitempty"`
+	Stream              bool          `json:"stream,omitempty"`
 	// StreamOptions.IncludeUsage 为 true 时流式末尾会带 usage。
 	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+}
+
+// stopSequences 兼容 OpenAI stop 的字符串与字符串数组联合格式。
+// 规范模型统一保存为切片，出向仍编码为数组以保持既有行为。
+type stopSequences []string
+
+func (s *stopSequences) UnmarshalJSON(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		*s = nil
+		return nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var value string
+		if err := json.Unmarshal(trimmed, &value); err != nil {
+			return fmt.Errorf("stop 字符串无效: %w", err)
+		}
+		*s = stopSequences{value}
+		return nil
+	}
+	var values []string
+	if err := json.Unmarshal(trimmed, &values); err != nil {
+		return fmt.Errorf("stop 必须是字符串或字符串数组: %w", err)
+	}
+	*s = stopSequences(values)
+	return nil
 }
 
 type streamOptions struct {
@@ -92,9 +128,15 @@ type choice struct {
 }
 
 type usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	// 指针用于区分“字段缺失”与“上游明确返回 0”。
+	PromptTokens       *int                `json:"prompt_tokens,omitempty"`
+	CompletionTokens   *int                `json:"completion_tokens,omitempty"`
+	TotalTokens        *int                `json:"total_tokens,omitempty"`
+	PromptTokenDetails *promptTokenDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+type promptTokenDetails struct {
+	CachedTokens *int `json:"cached_tokens,omitempty"`
 }
 
 // streamChunk 对应流式响应中每个 data: 块的结构。

@@ -67,8 +67,8 @@ func TestRequestLoggerAssignsRequestID(t *testing.T) {
 	}
 }
 
-// TestRequestLoggerReusesInboundID 带 X-Request-Id 时应复用之，便于跨服务串联。
-func TestRequestLoggerReusesInboundID(t *testing.T) {
+// TestRequestLoggerDoesNotTrustInboundID 确认外部高基数/超长 ID 不进入响应或日志。
+func TestRequestLoggerDoesNotTrustInboundID(t *testing.T) {
 	e, buf := newLoggerEngine(t)
 	e.GET("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -77,11 +77,11 @@ func TestRequestLoggerReusesInboundID(t *testing.T) {
 	w := httptest.NewRecorder()
 	e.ServeHTTP(w, req)
 
-	if got := w.Header().Get("X-Request-Id"); got != "req_inbound_123" {
-		t.Errorf("应复用入站 request_id，得到 %q", got)
+	if got := w.Header().Get("X-Request-Id"); got == "" || got == "req_inbound_123" {
+		t.Errorf("应生成独立服务端 request_id，得到 %q", got)
 	}
-	if m := parseLogLine(t, buf); m["request_id"] != "req_inbound_123" {
-		t.Errorf("日志应复用入站 request_id，得到 %v", m["request_id"])
+	if m := parseLogLine(t, buf); m["request_id"] == "req_inbound_123" {
+		t.Errorf("日志不得信任入站 request_id，得到 %v", m["request_id"])
 	}
 }
 

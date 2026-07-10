@@ -19,8 +19,10 @@ func (a *Adapter) NewStreamEncoder() adapter.StreamEncoder {
 // 且首片需带 role/id/name。这里把规范 block 索引映射为 OpenAI 的 tool_calls index，
 // 并记录哪些工具块已发过首片。
 type streamEncoder struct {
-	id    string
-	model string
+	id        string
+	model     string
+	usage     canonical.Usage
+	usageSent bool
 
 	// 规范 block 索引 -> OpenAI tool_calls index
 	toolIndex map[int]int
@@ -34,6 +36,7 @@ func (e *streamEncoder) Encode(event canonical.Event) ([]byte, error) {
 	case canonical.EventMessageStart:
 		e.id = event.ID
 		e.model = event.Model
+		e.mergeUsage(event.Usage)
 		// OpenAI 首个 chunk 通常发一个仅含 role 的 delta。
 		return e.marshalChunk(streamChoice{
 			Index: 0,
@@ -68,33 +71,90 @@ func (e *streamEncoder) Encode(event canonical.Event) ([]byte, error) {
 		return nil, nil
 
 	case canonical.EventMessageDelta:
+		e.mergeUsage(event.Usage)
 		if event.StopReason == "" {
-			// 仅 usage 的中间事件：OpenAI 在结束块统一带 usage，这里略过。
+			if event.UsageFinal && event.Usage != nil && !e.usageSent {
+				e.usageSent = true
+				return e.marshalUsageChunk(wireUsageFromCanonical(e.usage))
+			}
 			return nil, nil
 		}
 		finish := mapStopReasonToOpenAI(event.StopReason)
-		var u *usage
-		if event.Usage != nil {
-			u = &usage{
-				PromptTokens:     event.Usage.InputTokens,
-				CompletionTokens: event.Usage.OutputTokens,
-				TotalTokens:      event.Usage.InputTokens + event.Usage.OutputTokens,
-			}
-		}
-		return e.marshalChunk(streamChoice{
+		finishChunk, err := e.marshalChunk(streamChoice{
 			Index:        0,
 			Delta:        &streamDelta{},
 			FinishReason: &finish,
-		}, u)
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+		// OpenAI stream_options.include_usage 的标准形态是：先发带
+		// finish_reason 的 choice，再发 choices:[] 的独立最终 usage 块。
+		// Anthropic 的 stop_reason 与最终 usage 同处一个 canonical 事件，故这里
+		// 一次 Encode 返回两条相邻 SSE record，不能把 usage 塞进 choice 块。
+		if event.UsageFinal && event.Usage != nil && !e.usageSent {
+			usageChunk, err := e.marshalUsageChunk(wireUsageFromCanonical(e.usage))
+			if err != nil {
+				return nil, err
+			}
+			e.usageSent = true
+			return append(finishChunk, usageChunk...), nil
+		}
+		return finishChunk, nil
 
 	case canonical.EventMessageStop:
 		// OpenAI 以 "data: [DONE]" 结束整个流。
 		return []byte("data: [DONE]\n\n"), nil
 
-	case canonical.EventPing, canonical.EventError:
+	case canonical.EventError:
+		return marshalErrorEvent(event.Err)
+
+	case canonical.EventPing:
 		return nil, nil
 	}
 	return nil, nil
+}
+
+func marshalErrorEvent(message string) ([]byte, error) {
+	payload := map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "api_error",
+		},
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("openai: 编码流式错误失败: %w", err)
+	}
+	out := make([]byte, 0, len(b)+8)
+	out = append(out, "data: "...)
+	out = append(out, b...)
+	out = append(out, "\n\n"...)
+	return out, nil
+}
+
+func (e *streamEncoder) mergeUsage(in *canonical.Usage) {
+	if in == nil {
+		return
+	}
+	if in.InputTokensKnown {
+		e.usage.InputTokens = in.InputTokens
+		e.usage.InputTokensKnown = true
+	}
+	if in.OutputTokensKnown {
+		e.usage.OutputTokens = in.OutputTokens
+		e.usage.OutputTokensKnown = true
+	}
+	if in.TotalTokensKnown {
+		e.usage.ReportedTotalTokens = in.ReportedTotalTokens
+		e.usage.TotalTokensKnown = true
+	}
+	if in.CacheCreationInputTokens > e.usage.CacheCreationInputTokens {
+		e.usage.CacheCreationInputTokens = in.CacheCreationInputTokens
+	}
+	if in.CacheReadInputTokens > e.usage.CacheReadInputTokens {
+		e.usage.CacheReadInputTokens = in.CacheReadInputTokens
+	}
 }
 
 // encodeDelta 编码一个 block 增量。
@@ -162,6 +222,25 @@ func (e *streamEncoder) marshalChunk(ch streamChoice, u *usage) ([]byte, error) 
 	b, err := json.Marshal(chunk)
 	if err != nil {
 		return nil, fmt.Errorf("openai: 编码流式块失败: %w", err)
+	}
+	out := make([]byte, 0, len(b)+8)
+	out = append(out, "data: "...)
+	out = append(out, b...)
+	out = append(out, "\n\n"...)
+	return out, nil
+}
+
+func (e *streamEncoder) marshalUsageChunk(u *usage) ([]byte, error) {
+	chunk := streamChunk{
+		ID:      e.id,
+		Object:  "chat.completion.chunk",
+		Model:   e.model,
+		Choices: []streamChoice{},
+		Usage:   u,
+	}
+	b, err := json.Marshal(chunk)
+	if err != nil {
+		return nil, fmt.Errorf("openai: 编码流式 usage 块失败: %w", err)
 	}
 	out := make([]byte, 0, len(b)+8)
 	out = append(out, "data: "...)

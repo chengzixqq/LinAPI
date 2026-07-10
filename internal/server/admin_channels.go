@@ -15,7 +15,7 @@ type channelReq struct {
 	Name      string            `json:"name"`
 	Format    string            `json:"format" binding:"required"`
 	BaseURL   string            `json:"base_url" binding:"required"`
-	APIKey    string            `json:"api_key"`
+	APIKey    *string           `json:"api_key"`
 	Models    map[string]string `json:"models"`
 	Priority  int               `json:"priority"`
 	Weight    int               `json:"weight"`
@@ -23,7 +23,7 @@ type channelReq struct {
 }
 
 // toInput 把请求体转为领域入参；channelID 以路径参数为准（更新时）。
-func (r channelReq) toInput(channelID string) admin.ChannelInput {
+func (r channelReq) toInput(channelID string, creating bool) admin.ChannelInput {
 	enabled := true
 	if r.Enabled != nil {
 		enabled = *r.Enabled
@@ -32,12 +32,19 @@ func (r channelReq) toInput(channelID string) admin.ChannelInput {
 	if weight <= 0 {
 		weight = 1 // 权重下限保护，避免加权随机时权重为 0 的渠道永不被选
 	}
+	apiKey := ""
+	apiKeySet := creating
+	if r.APIKey != nil {
+		apiKey = *r.APIKey
+		apiKeySet = true
+	}
 	return admin.ChannelInput{
 		ChannelID: channelID,
 		Name:      r.Name,
 		Format:    r.Format,
 		BaseURL:   r.BaseURL,
-		APIKey:    r.APIKey,
+		APIKey:    apiKey,
+		APIKeySet: apiKeySet,
 		Models:    r.Models,
 		Priority:  r.Priority,
 		Weight:    weight,
@@ -55,7 +62,7 @@ func (h *adminHandlers) createChannel(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "format 必须为 openai 或 anthropic")
 		return
 	}
-	ch, err := h.svc.CreateChannel(c.Request.Context(), req.toInput(req.ChannelID))
+	ch, err := h.svc.CreateChannel(c.Request.Context(), req.toInput(req.ChannelID, true))
 	if err != nil {
 		writeAdminError(c, err)
 		return
@@ -95,7 +102,7 @@ func (h *adminHandlers) updateChannel(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "format 必须为 openai 或 anthropic")
 		return
 	}
-	ch, err := h.svc.UpdateChannel(c.Request.Context(), req.toInput(c.Param("id")))
+	ch, err := h.svc.UpdateChannel(c.Request.Context(), req.toInput(c.Param("id"), false))
 	if err != nil {
 		writeAdminError(c, err)
 		return
@@ -109,7 +116,7 @@ func (h *adminHandlers) setChannelEnabled(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
 		return
 	}
-	ch, err := h.svc.SetChannelEnabled(c.Request.Context(), c.Param("id"), req.Enabled)
+	ch, err := h.svc.SetChannelEnabled(c.Request.Context(), c.Param("id"), *req.Enabled)
 	if err != nil {
 		writeAdminError(c, err)
 		return
@@ -136,15 +143,16 @@ func validChannelFormat(format string) bool {
 	return format == "openai" || format == "anthropic"
 }
 
-// queryInt 读取查询参数并解析为 int，缺失或非法时返回默认值。
-func queryInt(c *gin.Context, key string, def int) int {
+// queryInt 读取并校验有界整数查询参数；缺失时返回默认值，非法或越界时写 400。
+func queryInt(c *gin.Context, key string, def, minValue, maxValue int) (int, bool) {
 	s := c.Query(key)
 	if s == "" {
-		return def
+		return def, true
 	}
 	v, err := strconv.Atoi(s)
-	if err != nil {
-		return def
+	if err != nil || v < minValue || v > maxValue {
+		writeError(c, http.StatusBadRequest, "invalid_request_error", key+" 查询参数越界")
+		return 0, false
 	}
-	return v
+	return v, true
 }

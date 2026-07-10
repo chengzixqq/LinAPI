@@ -8,6 +8,7 @@ package store
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // ErrKeyNotFound 表示 API Key 不存在或已禁用。
@@ -37,6 +38,9 @@ type Identity struct {
 
 	// Enabled 为 false 时密钥不可用。
 	Enabled bool
+
+	// CreatedAt 只供内存管理面与 PostgreSQL api_keys.created_at 对齐；热路径不依赖它。
+	CreatedAt time.Time
 }
 
 // Allows 返回该身份是否允许访问指定对外模型名。
@@ -56,8 +60,8 @@ func (id *Identity) Allows(model string) bool {
 // Store 是网关的数据访问接口。
 //
 // 约定：实现必须并发安全（多请求 goroutine 并发调用）。
-// 额度相关方法此处只做「读」，真正的原子扣费/退差在计费模块（第 6 步）
-// 用 Redis 完成，Store 负责与持久层对账。
+// Balance 返回权威可用余额视图；生产资金预授权/结算由 billing.PostgresLedger
+// 在事务中直接更新 users.balance，Redis 不参与资金增量修改。
 type Store interface {
 	// ResolveKey 按明文 API Key 解析调用方身份。
 	// 不存在或已禁用返回 ErrKeyNotFound。

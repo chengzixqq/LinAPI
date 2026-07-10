@@ -1,14 +1,28 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 
 	"linapi/internal/store"
 )
+
+type countingAuthStore struct {
+	calls atomic.Int32
+}
+
+func (s *countingAuthStore) ResolveKey(context.Context, string) (*store.Identity, error) {
+	s.calls.Add(1)
+	return nil, store.ErrKeyNotFound
+}
+
+func (*countingAuthStore) Balance(context.Context, string) (int64, error) { return 0, nil }
 
 func init() {
 	gin.SetMode(gin.TestMode)
@@ -83,5 +97,39 @@ func TestAuthInvalidKey(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("无效密钥应返回 401, 得到 %d", w.Code)
+	}
+}
+
+func TestAuthRejectsOversizedKeyBeforeStore(t *testing.T) {
+	st := &countingAuthStore{}
+	r := gin.New()
+	r.Use(Auth(st))
+	r.GET("/probe", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("Authorization", "Bearer "+strings.Repeat("x", maxAPIKeyBytes+1))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized || st.calls.Load() != 0 {
+		t.Fatalf("超长 Key 应在查库前拒绝: status=%d calls=%d", w.Code, st.calls.Load())
+	}
+}
+
+func TestAuthLookupGateDoesNotQueue(t *testing.T) {
+	gate := NewSemaphore(1)
+	if !gate.TryAcquire() {
+		t.Fatal("预占 gate 失败")
+	}
+	defer gate.Release()
+	r := gin.New()
+	r.Use(AuthWithGate(authTestStore(), gate))
+	r.GET("/probe", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("Authorization", "Bearer sk-good")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("鉴权查库并发满载应立即 503，得到 %d", w.Code)
 	}
 }

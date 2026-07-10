@@ -1,7 +1,6 @@
 package anthropic
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -22,9 +21,13 @@ type streamDecoder struct {
 }
 
 func (d *streamDecoder) Decode(raw []byte) ([]canonical.Event, error) {
-	// SSE 每条记录可能有 "event:" 与 "data:" 两行；只需解析 data 行的 JSON，
-	// 事件类型 JSON 内也有（type 字段），故忽略 event 行。
-	line := extractDataLine(raw)
+	line, hasData := adapter.SSEData(raw)
+	if !hasData {
+		if len(raw) == 0 {
+			return nil, nil
+		}
+		return []canonical.Event{{Type: canonical.EventPing}}, nil
+	}
 	if len(line) == 0 {
 		return nil, nil
 	}
@@ -41,12 +44,7 @@ func (d *streamDecoder) Decode(raw []byte) ([]canonical.Event, error) {
 			out.ID = ev.Message.ID
 			out.Model = ev.Message.Model
 			if ev.Message.Usage != nil {
-				out.Usage = &canonical.Usage{
-					InputTokens:              ev.Message.Usage.InputTokens,
-					OutputTokens:             ev.Message.Usage.OutputTokens,
-					CacheCreationInputTokens: ev.Message.Usage.CacheCreationInputTokens,
-					CacheReadInputTokens:     ev.Message.Usage.CacheReadInputTokens,
-				}
+				out.Usage = canonicalUsageFromWire(ev.Message.Usage)
 			}
 		}
 		return []canonical.Event{out}, nil
@@ -76,14 +74,15 @@ func (d *streamDecoder) Decode(raw []byte) ([]canonical.Event, error) {
 
 	case "message_delta":
 		out := canonical.Event{Type: canonical.EventMessageDelta}
-		if ev.Delta != nil && ev.Delta.StopReason != "" {
+		terminal := ev.Delta != nil && ev.Delta.StopReason != ""
+		if terminal {
 			out.StopReason = mapStopReasonToCanonical(ev.Delta.StopReason)
 		}
 		if ev.Usage != nil {
-			out.Usage = &canonical.Usage{
-				InputTokens:  ev.Usage.InputTokens,
-				OutputTokens: ev.Usage.OutputTokens,
-			}
+			out.Usage = canonicalUsageFromWire(ev.Usage)
+			// Anthropic 的最终 usage 与终止 message_delta 同步出现。兼容上游
+			// 若在生成中途发送 usage，只能作为临时观测值，不能据此精确结算。
+			out.UsageFinal = terminal
 		}
 		return []canonical.Event{out}, nil
 
@@ -155,17 +154,3 @@ func wireBlockType(t string) canonical.BlockType {
 }
 
 // extractDataLine 从可能含 "event:" / "data:" 多行的 SSE 记录中取出 data 的 JSON 部分。
-func extractDataLine(raw []byte) []byte {
-	for _, ln := range bytes.Split(raw, []byte("\n")) {
-		ln = bytes.TrimSpace(ln)
-		if bytes.HasPrefix(ln, []byte("data:")) {
-			return bytes.TrimSpace(bytes.TrimPrefix(ln, []byte("data:")))
-		}
-	}
-	// 没有 data: 前缀时，可能本身就是 JSON。
-	trimmed := bytes.TrimSpace(raw)
-	if bytes.HasPrefix(trimmed, []byte("{")) {
-		return trimmed
-	}
-	return nil
-}

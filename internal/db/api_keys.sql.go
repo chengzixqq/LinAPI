@@ -86,6 +86,39 @@ func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (Api
 	return i, err
 }
 
+const createAPIKeyLimited = `-- name: CreateAPIKeyLimited :one
+WITH lock_row AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock(hashtextextended($3, 0))
+)
+INSERT INTO api_keys (
+    key_hash, key_id, user_external_id, rate_limit_per_min, allowed_models, enabled
+)
+SELECT $1, $2, $3, $4, $5, $6
+FROM lock_row
+WHERE (SELECT count(*) FROM api_keys WHERE user_external_id = $3) < $7
+RETURNING id, key_hash, key_id, user_external_id, rate_limit_per_min, allowed_models, enabled, created_at
+`
+
+type CreateAPIKeyLimitedParams struct {
+	KeyHash         string   `json:"key_hash"`
+	KeyID           string   `json:"key_id"`
+	UserExternalID  string   `json:"user_external_id"`
+	RateLimitPerMin int32    `json:"rate_limit_per_min"`
+	AllowedModels   []string `json:"allowed_models"`
+	Enabled         bool     `json:"enabled"`
+	MaxKeys         int32    `json:"max_keys"`
+}
+
+func (q *Queries) CreateAPIKeyLimited(ctx context.Context, arg CreateAPIKeyLimitedParams) (ApiKey, error) {
+	row := q.db.QueryRow(ctx, createAPIKeyLimited,
+		arg.KeyHash, arg.KeyID, arg.UserExternalID, arg.RateLimitPerMin,
+		arg.AllowedModels, arg.Enabled, arg.MaxKeys,
+	)
+	var i ApiKey
+	err := row.Scan(&i.ID, &i.KeyHash, &i.KeyID, &i.UserExternalID, &i.RateLimitPerMin, &i.AllowedModels, &i.Enabled, &i.CreatedAt)
+	return i, err
+}
+
 const listAPIKeysByUser = `-- name: ListAPIKeysByUser :many
 SELECT id, key_id, user_external_id, rate_limit_per_min, allowed_models, enabled, created_at
 FROM api_keys

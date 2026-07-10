@@ -6,11 +6,11 @@
 //	按客户端格式 ParseRequest 解析为 canonical
 //	 → 路由 Select 拿候选渠道（已按优先级/权重排序、过滤熔断）
 //	 → 逐候选：Breaker.Allow() 准入 → 按渠道格式 BuildRequest 发上游
-//	          → 成功则反向转换响应、RecordSuccess；失败 RecordFailure 换下一个
+//	          → 通过许可回报成功/失败；客户端取消以中性结果停止
 //	 → 计费结算：Settle（按真实用量退差 + 记用量日志）或 Refund（全败全额退押金）
 //
 // 与 routing 包的约定：拿到 []Candidate 后必须对每个尝试的候选调用 Breaker.Allow()，
-// 并配对 RecordSuccess/RecordFailure，否则半开探测额度会泄漏、熔断器卡死。
+// 并通过返回的许可配对回报结果，否则半开探测额度会泄漏、熔断器卡死。
 package forwarder
 
 import (

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,24 +37,44 @@ type authHandlers struct {
 	// bcryptSem 是 bcrypt 并发信号量（审查 AUD-P1-27）：login/register 在做密码哈希/比较
 	// 前须先取一个槽，把在途 bcrypt goroutine 数卡在上限内，防匿名并发登录耗尽 CPU。
 	// 为 nil 时不限制并发（测试便利）。
-	bcryptSem *middleware.Semaphore
+	bcryptSem       *middleware.Semaphore
+	credentialLimit *middleware.IdentifierRateLimiter
 }
 
-func newAuthHandlers(accounts account.AccountStore, settings account.SettingsStore, sessions *session.Manager, secureCookie bool, bcryptSem *middleware.Semaphore) *authHandlers {
-	return &authHandlers{accounts: accounts, settings: settings, sessions: sessions, secureCookie: secureCookie, bcryptSem: bcryptSem}
+func newAuthHandlers(accounts account.AccountStore, settings account.SettingsStore, sessions *session.Manager, secureCookie bool, bcryptSem *middleware.Semaphore, credentialLimit *middleware.IdentifierRateLimiter) *authHandlers {
+	return &authHandlers{
+		accounts: accounts, settings: settings, sessions: sessions, secureCookie: secureCookie,
+		bcryptSem: bcryptSem, credentialLimit: credentialLimit,
+	}
 }
 
-// acquireBcrypt 取一枚 bcrypt 并发槽；成功返回释放函数。信号量为 nil 时直接放行。
-// ctx 取消/超时（并发过高排不上队）返回 false，调用方应回 503 让客户端稍后重试，
-// 而非无界堆积 goroutine 把 CPU 打满。
-func (h *authHandlers) acquireBcrypt(ctx context.Context) (release func(), ok bool) {
+// acquireBcrypt 非阻塞获取一枚 bcrypt 并发槽；成功返回释放函数。信号量为 nil 时
+// 直接放行。容量已满立即返回 false，由调用方回 503，不留下等待中的 handler。
+func (h *authHandlers) acquireBcrypt() (release func(), ok bool) {
 	if h.bcryptSem == nil {
 		return func() {}, true
 	}
-	if !h.bcryptSem.Acquire(ctx) {
+	if !h.bcryptSem.TryAcquire() {
 		return nil, false
 	}
 	return h.bcryptSem.Release, true
+}
+
+func (h *authHandlers) allowCredential(c *gin.Context, scope, username string) bool {
+	if h.credentialLimit == nil {
+		return true
+	}
+	allowed, retryAfter, err := h.credentialLimit.Allow(c.Request.Context(), scope, username)
+	if err != nil {
+		// 与来源 IP 限流一致：Redis 短暂故障时 fail-open，bcrypt 全局并发槽仍兜底。
+		return true
+	}
+	if allowed {
+		return true
+	}
+	c.Header("Retry-After", strconv.Itoa(retryAfter))
+	writeError(c, http.StatusTooManyRequests, "rate_limit_error", "认证请求过于频繁，请稍后重试")
+	return false
 }
 
 type credentialsReq struct {
@@ -84,6 +105,9 @@ func (h *authHandlers) register(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
 		return
 	}
+	if !h.allowCredential(c, "register", req.Username) {
+		return
+	}
 	settings, err := h.settings.Get(c.Request.Context())
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "internal_error", "读取系统设置失败")
@@ -94,7 +118,7 @@ func (h *authHandlers) register(c *gin.Context) {
 		return
 	}
 	// bcrypt 前取并发槽（审查 AUD-P1-27）：排不上队即回 503，避免 goroutine 无界堆积。
-	release, ok := h.acquireBcrypt(c.Request.Context())
+	release, ok := h.acquireBcrypt()
 	if !ok {
 		writeError(c, http.StatusServiceUnavailable, "internal_error", "服务繁忙，请稍后重试")
 		return
@@ -102,8 +126,8 @@ func (h *authHandlers) register(c *gin.Context) {
 	hash, err := account.HashPassword(req.Password)
 	release()
 	if err != nil {
-		if errors.Is(err, account.ErrPasswordTooShort) {
-			writeError(c, http.StatusBadRequest, "invalid_request_error", "密码长度不足（至少 8 位）")
+		if errors.Is(err, account.ErrPasswordTooShort) || errors.Is(err, account.ErrPasswordTooLong) {
+			writeError(c, http.StatusBadRequest, "invalid_request_error", "密码须至少 8 个字符且不超过 72 字节")
 			return
 		}
 		writeError(c, http.StatusInternalServerError, "internal_error", "处理密码失败")
@@ -112,16 +136,18 @@ func (h *authHandlers) register(c *gin.Context) {
 	// 自助注册恒不发放额度（审查 AUD-P0-07）：绑定初始余额固定为 0，忽略
 	// settings.NewUserInitialBalance。否则任何人注册一个账号即克隆一笔免费额度，
 	// 注册开关一开即被薅穿。要给新用户发额度只能走管理面主动建号 / 充值（可信操作）。
-	acc, err := h.accounts.CreateUserAccount(c.Request.Context(), req.Username, hash, 0)
+	_, err = h.accounts.CreateUserAccount(c.Request.Context(), req.Username, hash, 0)
 	if err != nil {
 		if errors.Is(err, account.ErrConflict) {
-			writeError(c, http.StatusConflict, "conflict", "用户名已存在")
+			// 与成功使用完全相同的状态和响应，避免注册端点旁路登录的统一错误，
+			// 泄露用户名是否存在（审查 AUD-P2-21）。
+			c.JSON(http.StatusCreated, gin.H{"ok": true})
 			return
 		}
 		writeError(c, http.StatusInternalServerError, "internal_error", "创建账户失败")
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"username": acc.Username, "role": acc.Role})
+	c.JSON(http.StatusCreated, gin.H{"ok": true})
 }
 
 // login 校验账密，建会话，下发 Cookie。
@@ -129,6 +155,9 @@ func (h *authHandlers) login(c *gin.Context) {
 	var req credentialsReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
+		return
+	}
+	if !h.allowCredential(c, "login", req.Username) {
 		return
 	}
 	cred, err := h.accounts.GetCredentials(c.Request.Context(), req.Username)
@@ -139,7 +168,7 @@ func (h *authHandlers) login(c *gin.Context) {
 	}
 	// bcrypt 前取并发槽（审查 AUD-P1-27）：无论账户是否存在都同样 acquire+compare，
 	// 保持恒定工作量侧信道防护；排不上队即回 503，避免并发登录耗尽 CPU。
-	release, ok := h.acquireBcrypt(c.Request.Context())
+	release, ok := h.acquireBcrypt()
 	if !ok {
 		writeError(c, http.StatusServiceUnavailable, "internal_error", "服务繁忙，请稍后重试")
 		return
@@ -169,6 +198,10 @@ func (h *authHandlers) login(c *gin.Context) {
 		SessionVersion: cred.SessionVersion,
 	}, ttl)
 	if err != nil {
+		if errors.Is(err, session.ErrTooManyActiveSessions) {
+			writeError(c, http.StatusTooManyRequests, "rate_limit_error", "活跃会话数已达上限，请先退出其它设备")
+			return
+		}
 		writeError(c, http.StatusServiceUnavailable, "internal_error", "会话服务暂时不可用")
 		return
 	}

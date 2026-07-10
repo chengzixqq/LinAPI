@@ -100,8 +100,8 @@ func (r *Router) Channels() []*Channel {
 
 // Select 返回可服务 model 的候选渠道有序序列（已按优先级+权重排序，
 // 并过滤掉当前被熔断的渠道）。转发器应依次尝试：对每个候选，先调用
-// Candidate.Breaker.Allow() 做带副作用的准入（半开限流），获准后发起请求，
-// 再按成败调用 RecordSuccess/RecordFailure。
+// Candidate.Breaker.Allow() 做带副作用的准入（半开限流），获准后保留许可，
+// 再按尝试结果通过许可回报成功、失败或中性结束。
 //
 // 这里用无副作用的 Breaker.Ready() 过滤，避免为未真正尝试的候选
 // 提前消耗半开探测额度。若无渠道支持或全部被熔断则返回 ErrNoChannel。

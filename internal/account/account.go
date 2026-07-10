@@ -50,8 +50,8 @@ type Credentials struct {
 	PasswordHash string
 }
 
-// CreateAccountInput 是新建账户的入参。PasswordHash 已是 bcrypt 哈希。
-// ExternalID 对 user 角色为其计费实体标识；admin 角色可空。
+// CreateAccountInput 是直接新建管理员账户的入参。PasswordHash 已是 bcrypt 哈希。
+// user 必须走 CreateUserAccount，保证账户与计费实体原子创建。
 type CreateAccountInput struct {
 	Username     string
 	PasswordHash string
@@ -66,7 +66,7 @@ type AccountStore interface {
 	// CreateUserAccount 原子地建 user 账户 + 计费实体（余额 initialBalance），
 	// 回填 external_id 关联。任一步失败整体失败、不留孤儿。返回账户视图。
 	CreateUserAccount(ctx context.Context, username, passwordHash string, initialBalance int64) (Account, error)
-	// CreateAccount 直接建账户（供 bootstrap 建 admin，不连带计费实体）。
+	// CreateAccount 直接建 admin 账户（供 bootstrap；拒绝 user 绕过计费实体创建）。
 	CreateAccount(ctx context.Context, in CreateAccountInput) (Account, error)
 	// GetCredentials 按用户名取账户 + 密码哈希（登录校验）。
 	GetCredentials(ctx context.Context, username string) (Credentials, error)

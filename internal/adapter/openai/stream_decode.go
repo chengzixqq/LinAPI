@@ -35,12 +35,16 @@ type streamDecoder struct {
 }
 
 func (d *streamDecoder) Decode(raw []byte) ([]canonical.Event, error) {
-	// 去掉 SSE 的 "data: " 前缀与空白。
-	line := bytes.TrimSpace(raw)
-	line = bytes.TrimPrefix(line, []byte("data:"))
+	line, hasData := adapter.SSEData(raw)
 	line = bytes.TrimSpace(line)
 
-	// 空行或结束标记。
+	// comment / event / id / retry 等无 data 记录等价于心跳，不影响终态。
+	if !hasData {
+		if len(bytes.TrimSpace(raw)) == 0 {
+			return nil, nil
+		}
+		return []canonical.Event{{Type: canonical.EventPing}}, nil
+	}
 	if len(line) == 0 {
 		return nil, nil
 	}
@@ -52,6 +56,14 @@ func (d *streamDecoder) Decode(raw []byte) ([]canonical.Event, error) {
 	if err := json.Unmarshal(line, &chunk); err != nil {
 		return nil, fmt.Errorf("openai: 解析流式块失败: %w", err)
 	}
+	var errorEnvelope struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(line, &errorEnvelope); err == nil && errorEnvelope.Error != nil {
+		return []canonical.Event{{Type: canonical.EventError, Err: errorEnvelope.Error.Message}}, nil
+	}
 
 	var events []canonical.Event
 
@@ -62,7 +74,6 @@ func (d *streamDecoder) Decode(raw []byte) ([]canonical.Event, error) {
 			Type:  canonical.EventMessageStart,
 			ID:    chunk.ID,
 			Model: chunk.Model,
-			Usage: &canonical.Usage{},
 		})
 	}
 
@@ -70,14 +81,15 @@ func (d *streamDecoder) Decode(raw []byte) ([]canonical.Event, error) {
 	if len(chunk.Choices) == 0 {
 		if chunk.Usage != nil {
 			events = append(events, canonical.Event{
-				Type: canonical.EventMessageDelta,
-				Usage: &canonical.Usage{
-					InputTokens:  chunk.Usage.PromptTokens,
-					OutputTokens: chunk.Usage.CompletionTokens,
-				},
+				Type:       canonical.EventMessageDelta,
+				Usage:      canonicalUsageFromWire(chunk.Usage),
+				UsageFinal: true,
 			})
 		}
 		return events, nil
+	}
+	if len(chunk.Choices) != 1 || chunk.Choices[0].Index != 0 {
+		return nil, fmt.Errorf("openai: n=1 流收到异常的多 choice/index 块")
 	}
 
 	ch := chunk.Choices[0]
@@ -117,10 +129,8 @@ func (d *streamDecoder) Decode(raw []byte) ([]canonical.Event, error) {
 			StopReason: mapFinishReasonToCanonical(*ch.FinishReason),
 		}
 		if chunk.Usage != nil {
-			ev.Usage = &canonical.Usage{
-				InputTokens:  chunk.Usage.PromptTokens,
-				OutputTokens: chunk.Usage.CompletionTokens,
-			}
+			ev.Usage = canonicalUsageFromWire(chunk.Usage)
+			ev.UsageFinal = true
 		}
 		events = append(events, ev)
 	}

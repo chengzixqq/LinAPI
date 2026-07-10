@@ -39,14 +39,31 @@ type Usage struct {
 	InputTokens  int
 	OutputTokens int
 
+	// *Known 区分“上游明确返回 0”与“字段完全缺失”。计费只有在字段存在性
+	// 可证明时才使用精确 token 结算；缺失或冲突时必须走保守结算，不能把 Go
+	// 零值误当成零成本（审查 AUD-P0-02 / AUD-P0-06）。
+	InputTokensKnown  bool
+	OutputTokensKnown bool
+
+	// ReportedTotalTokens 保存上游显式返回的 total_tokens。OpenAI 某些兼容
+	// 上游只返回 total，或只返回 total + 单边 token；保留它才能安全推导缺失边，
+	// 或按较高单价做保守结算。
+	ReportedTotalTokens int
+	TotalTokensKnown    bool
+
 	// 缓存相关（Claude prompt caching 等），无则为 0。
 	CacheCreationInputTokens int
 	CacheReadInputTokens     int
 }
 
-// TotalTokens 返回输入与输出 token 之和。
+// TotalTokens 返回普通输入、缓存创建、缓存读取与输出 token 之和。
 func (u Usage) TotalTokens() int {
-	return u.InputTokens + u.OutputTokens
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens + u.OutputTokens
+}
+
+// Complete 返回输入与输出 token 是否都由上游明确给出或可可靠推导。
+func (u Usage) Complete() bool {
+	return u.InputTokensKnown && u.OutputTokensKnown
 }
 
 // ---- 流式事件 ----
@@ -86,6 +103,9 @@ type Event struct {
 
 	// Usage 在 EventMessageStart / EventMessageDelta 时可能携带（增量或最终）。
 	Usage *Usage
+	// UsageFinal 表示该 usage 是供应商声明的最终用量。流式结算必须同时看到
+	// message_stop 与最终用量；仅有 message_start 的输入 token 不足以精确结算。
+	UsageFinal bool
 
 	// ID / Model 在 EventMessageStart 时携带。
 	ID    string

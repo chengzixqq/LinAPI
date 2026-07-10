@@ -8,10 +8,12 @@ package session
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,8 +21,9 @@ import (
 
 // TTL 常量。
 const (
-	DefaultTTL  = 24 * time.Hour
-	RememberTTL = 7 * 24 * time.Hour
+	DefaultTTL               = 24 * time.Hour
+	RememberTTL              = 7 * 24 * time.Hour
+	DefaultMaxActiveSessions = 10
 )
 
 // keyPrefix 是会话在 Redis 的键前缀。
@@ -28,6 +31,8 @@ const keyPrefix = "session:"
 
 // ErrNotFound 表示会话不存在或已过期。
 var ErrNotFound = errors.New("session: 会话不存在或已过期")
+
+var ErrTooManyActiveSessions = errors.New("session: 活跃会话数已达上限")
 
 // SessionData 是一份会话承载的身份信息（登录时写入，鉴权时读出）。
 type SessionData struct {
@@ -47,16 +52,44 @@ type SessionData struct {
 
 // Manager 管理会话的生命周期。
 type Manager struct {
-	rdb *redis.Client
+	rdb           *redis.Client
+	maxPerAccount int
 }
 
 // NewManager 构造会话管理器。
 func NewManager(rdb *redis.Client) *Manager {
-	return &Manager{rdb: rdb}
+	return NewManagerWithLimit(rdb, DefaultMaxActiveSessions)
 }
+
+func NewManagerWithLimit(rdb *redis.Client, maxPerAccount int) *Manager {
+	return &Manager{rdb: rdb, maxPerAccount: maxPerAccount}
+}
+
+var createScript = redis.NewScript(`
+local clock = redis.call('TIME')
+local now_ms = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local ttl_ms = tonumber(ARGV[2])
+local max_sessions = tonumber(ARGV[4])
+
+redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now_ms)
+if max_sessions > 0 and redis.call('ZCARD', KEYS[2]) >= max_sessions then
+  return 0
+end
+
+redis.call('PSETEX', KEYS[1], ttl_ms, ARGV[1])
+redis.call('ZADD', KEYS[2], now_ms + ttl_ms, ARGV[3])
+local current_ttl = redis.call('PTTL', KEYS[2])
+if current_ttl < ttl_ms then
+  redis.call('PEXPIRE', KEYS[2], ttl_ms)
+end
+return 1
+`)
 
 // Create 生成一个随机 token，把会话数据以给定 TTL 存入 Redis。
 func (m *Manager) Create(ctx context.Context, data SessionData, ttl time.Duration) (string, error) {
+	if ttl <= 0 || data.AccountID <= 0 {
+		return "", fmt.Errorf("创建会话参数无效")
+	}
 	token, err := randomHex(32)
 	if err != nil {
 		return "", fmt.Errorf("生成会话 token 失败: %w", err)
@@ -66,8 +99,15 @@ func (m *Manager) Create(ctx context.Context, data SessionData, ttl time.Duratio
 	if err != nil {
 		return "", err
 	}
-	if err := m.rdb.Set(ctx, keyPrefix+token, payload, ttl).Err(); err != nil {
+	created, err := createScript.Run(ctx, m.rdb,
+		[]string{sessionKey(token), sessionIndexKey(data.AccountID)},
+		payload, ttl.Milliseconds(), sessionDigest(token), m.maxPerAccount,
+	).Int()
+	if err != nil {
 		return "", fmt.Errorf("写入会话失败: %w", err)
+	}
+	if created != 1 {
+		return "", ErrTooManyActiveSessions
 	}
 	return token, nil
 }
@@ -89,7 +129,7 @@ func randomHex(n int) (string, error) {
 
 // Get 按 token 反查会话数据；不存在或过期返回 ErrNotFound。
 func (m *Manager) Get(ctx context.Context, token string) (SessionData, error) {
-	raw, err := m.rdb.Get(ctx, keyPrefix+token).Bytes()
+	raw, err := m.rdb.Get(ctx, sessionKey(token)).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return SessionData{}, ErrNotFound
@@ -105,5 +145,34 @@ func (m *Manager) Get(ctx context.Context, token string) (SessionData, error) {
 
 // Delete 删除会话（登出）。删除不存在的 token 不视为错误。
 func (m *Manager) Delete(ctx context.Context, token string) error {
-	return m.rdb.Del(ctx, keyPrefix+token).Err()
+	key := sessionKey(token)
+	raw, err := m.rdb.Get(ctx, key).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var data SessionData
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return err
+	}
+	pipe := m.rdb.TxPipeline()
+	pipe.Del(ctx, key)
+	pipe.ZRem(ctx, sessionIndexKey(data.AccountID), sessionDigest(token))
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func sessionKey(token string) string {
+	return keyPrefix + sessionDigest(token)
+}
+
+func sessionDigest(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func sessionIndexKey(accountID int64) string {
+	return "sessions:account:" + strconv.FormatInt(accountID, 10)
 }

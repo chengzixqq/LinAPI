@@ -2,98 +2,218 @@ package billing
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
 	"time"
+
+	"linapi/internal/canonical"
 )
 
-// Billing 是计费门面，聚合计价、Redis 账户与异步用量记录，
-// 向转发层提供「预扣 → 结算」两个原子步骤。并发安全。
+// Billing 是计价与持久账本门面。资金正确性只依赖 Ledger；Redis 不再执行任何
+// 增量扣款，因此重试、过期或全库丢失都不会改变权威余额。
 type Billing struct {
-	pricing  *Pricing
-	account  *Account
-	recorder *Recorder
-
-	// defaultReserve 是无法预估时的默认预扣额（最小计费单位）。
-	// 预扣是「押金」，Settle 时按真实用量退差，故可略高以覆盖长回复。
+	pricing        *Pricing
+	ledger         Ledger
 	defaultReserve int64
 }
 
-// New 构建计费门面。
-func New(pricing *Pricing, account *Account, recorder *Recorder, defaultReserve int64) *Billing {
-	return &Billing{
-		pricing:        pricing,
-		account:        account,
-		recorder:       recorder,
-		defaultReserve: defaultReserve,
-	}
+func New(pricing *Pricing, ledger Ledger, defaultReserve int64) *Billing {
+	return &Billing{pricing: pricing, ledger: ledger, defaultReserve: defaultReserve}
 }
 
-// Reservation 是一次预扣的句柄，转发完成后据此结算。
-type Reservation struct {
-	UserID string
-	KeyID  string
-	Model  string
-	// Amount 是已预扣的押金额。
-	Amount int64
-	// Seed 是预扣时用于惰性初始化 Redis 的冷源余额（供 Settle 复用）。
-	Seed int64
+type ReserveRequest struct {
+	TraceID         string
+	UserID          string
+	KeyID           string
+	Model           string
+	MaxOutputTokens int
 }
 
-// Reserve 在请求转发前预扣押金。seed 是该用户在冷源（store）的权威余额，
-// 仅当 Redis 尚无该用户余额时用于初始化。返回预扣句柄；余额不足时 ok=false。
-func (b *Billing) Reserve(ctx context.Context, userID, keyID, model string, seed int64) (Reservation, bool, error) {
-	amount := b.defaultReserve
-	ok, _, err := b.account.Reserve(ctx, userID, amount, seed)
+// NormalizeMaxOutput 校验客户端输出上限；缺失时返回必须写入上游请求的服务端上限。
+func (b *Billing) NormalizeMaxOutput(model string, requested *int) (int, error) {
+	return b.pricing.NormalizeMaxOutput(model, requested)
+}
+
+// ValidateModel 验证一个对外模型拥有非零价格与可证明的预授权边界。
+func (b *Billing) ValidateModel(model string) error {
+	maxOutput, err := b.pricing.NormalizeMaxOutput(model, nil)
 	if err != nil {
-		return Reservation{}, false, err
-	}
-	if !ok {
-		return Reservation{}, false, nil
-	}
-	return Reservation{
-		UserID: userID,
-		KeyID:  keyID,
-		Model:  model,
-		Amount: amount,
-		Seed:   seed,
-	}, true, nil
-}
-
-// Settle 在转发完成后按真实用量结算：算出实际成本，退回「押金 - 成本」的差额
-// （成本超押金则补收），并异步记一条用量日志。
-//
-// channel 是实际命中的上游渠道 ID，requestID 用于对账/幂等。
-func (b *Billing) Settle(ctx context.Context, r Reservation, channel, requestID string, inputTokens, outputTokens int) error {
-	cost := b.pricing.Cost(r.Model, inputTokens, outputTokens)
-
-	// 退差：押金 - 实际成本。正=退回多扣的，负=补收不足的。
-	delta := r.Amount - cost
-	if _, err := b.account.Settle(ctx, r.UserID, delta, r.Seed); err != nil {
 		return err
 	}
-
-	b.recorder.Record(UsageRecord{
-		RequestID:    requestID,
-		UserID:       r.UserID,
-		KeyID:        r.KeyID,
-		Model:        r.Model,
-		Channel:      channel,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		Cost:         cost,
-		CreatedAt:    time.Now(),
-	})
-	return nil
-}
-
-// Refund 在预扣后、转发彻底失败（未产生任何用量）时全额退回押金。
-// 转发层在所有候选渠道都失败、没有可计费用量时调用。
-func (b *Billing) Refund(ctx context.Context, r Reservation) error {
-	_, err := b.account.Settle(ctx, r.UserID, r.Amount, r.Seed)
+	_, _, err = b.pricing.ReservationCost(model, maxOutput)
 	return err
 }
 
-// SyncBalance 用冷源权威余额刷新 Redis 热副本。
-// 充值（改冷源余额）后必须调用，否则热副本仍是旧值（惰性 seed 不覆盖已存在的 key）。
-func (b *Billing) SyncBalance(ctx context.Context, userID string, balance int64) error {
-	return b.account.Sync(ctx, userID, balance)
+// Reserve 按模型最大可计费输入和本次强制输出上限持久预授权。
+func (b *Billing) Reserve(ctx context.Context, in ReserveRequest) (Reservation, bool, error) {
+	amount, maxInput, err := b.pricing.ReservationCost(in.Model, in.MaxOutputTokens)
+	if err != nil {
+		return Reservation{}, false, err
+	}
+	if b.defaultReserve > amount {
+		amount = b.defaultReserve
+	}
+	if amount <= 0 {
+		return Reservation{}, false, fmt.Errorf("%w: 预授权金额必须为正", ErrInvalidTokenLimit)
+	}
+	id, err := newReservationID()
+	if err != nil {
+		return Reservation{}, false, err
+	}
+	r := Reservation{
+		ID: id, TraceID: in.TraceID, UserID: in.UserID, KeyID: in.KeyID, Model: in.Model,
+		Amount: amount, MaxInputTokens: maxInput, MaxOutputTokens: in.MaxOutputTokens,
+		CreatedAt: time.Now().UTC(),
+	}
+	ok, err := b.ledger.Reserve(ctx, r)
+	return r, ok, err
+}
+
+// Settle 先持久化“上游已消费”的事实，再执行可重试的最终结算。任一步失败时
+// Reservation 都不会被外层当成可退款请求；RecordConsumption 成功后还可由 Recover
+// 在重启时继续完成。
+func (b *Billing) Settle(ctx context.Context, r Reservation, channel string, usage canonical.Usage) error {
+	cost, input, output, complete, estimated := b.settlementCost(r, usage)
+	if cost > r.Amount {
+		return fmt.Errorf("%w: cost=%d reservation=%d", ErrReservationExceeded, cost, r.Amount)
+	}
+	c := Consumption{
+		ReservationID: r.ID, Channel: channel,
+		InputTokens: safeTokenValue(input), OutputTokens: safeTokenValue(output),
+		CacheCreationInputTokens: safeTokenValue(usage.CacheCreationInputTokens),
+		CacheReadInputTokens:     safeTokenValue(usage.CacheReadInputTokens),
+		ReportedTotalTokens:      safeTokenValue(usage.ReportedTotalTokens),
+		Cost:                     cost, UsageComplete: complete, Estimated: estimated,
+		RecordedAt: time.Now().UTC(),
+	}
+	if err := b.recordConsumptionWithRetry(ctx, c); err != nil {
+		return err
+	}
+	return b.ledger.Finalize(ctx, r.ID)
+}
+
+// recordConsumptionWithRetry 缩小瞬时 PostgreSQL/提交结果未知导致精确 usage 只留在
+// 进程内存的窗口。Ledger 的 RecordConsumption 必须幂等；参数冲突/非法状态不重试。
+func (b *Billing) recordConsumptionWithRetry(ctx context.Context, c Consumption) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := b.ledger.RecordConsumption(ctx, c); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if errors.Is(err, ErrReservationConflict) || errors.Is(err, ErrInvalidTransition) ||
+				errors.Is(err, ErrReservationExceeded) {
+				return err
+			}
+		}
+		if attempt == 2 {
+			break
+		}
+		timer := time.NewTimer(time.Duration(25*(attempt+1)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			_ = timer.Stop()
+			return errors.Join(lastErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return lastErr
+}
+
+func (b *Billing) MarkInFlight(ctx context.Context, r Reservation, channel string) error {
+	return b.ledger.MarkInFlight(ctx, r.ID, channel)
+}
+
+func (b *Billing) ReleaseAttempt(ctx context.Context, r Reservation) error {
+	return b.ledger.ReleaseAttempt(ctx, r.ID)
+}
+
+func (b *Billing) Refund(ctx context.Context, r Reservation) error {
+	return b.ledger.Refund(ctx, r.ID)
+}
+
+func (b *Billing) Recover(ctx context.Context) error {
+	return b.ledger.Recover(ctx)
+}
+
+func (b *Billing) settlementCost(r Reservation, usage canonical.Usage) (cost int64, input, output int, complete, estimated bool) {
+	input, output = usage.InputTokens, usage.OutputTokens
+	inputKnown, outputKnown := usage.InputTokensKnown, usage.OutputTokensKnown
+	cacheTotal, cacheOK := checkedUsageTokenSum(usage.CacheCreationInputTokens, usage.CacheReadInputTokens)
+	if !cacheOK {
+		return r.Amount, input, output, false, true
+	}
+
+	if usage.TotalTokensKnown {
+		total := usage.ReportedTotalTokens
+		if total >= 0 && total < cacheTotal {
+			return r.Amount, input, output, false, true
+		}
+		switch {
+		case total < 0:
+			return r.Amount, input, output, false, true
+		case inputKnown && outputKnown:
+			calculated, ok := checkedUsageTokenSum(input, cacheTotal, output)
+			if !ok || calculated != total {
+				return r.Amount, input, output, false, true
+			}
+		case inputKnown:
+			known, ok := checkedUsageTokenSum(input, cacheTotal)
+			if !ok || total < known {
+				return r.Amount, input, output, false, true
+			}
+			output, outputKnown = total-known, true
+		case outputKnown:
+			known, ok := checkedUsageTokenSum(output, cacheTotal)
+			if !ok || total < known {
+				return r.Amount, input, output, false, true
+			}
+			input, inputKnown = total-known, true
+		default:
+			cost, err := b.pricing.ConservativeTotalCost(r.Model, total)
+			if err != nil {
+				return r.Amount, 0, 0, false, true
+			}
+			return cost, 0, 0, false, true
+		}
+	}
+
+	if !inputKnown || !outputKnown || input < 0 || output < 0 {
+		return r.Amount, input, output, false, true
+	}
+	cost, err := b.pricing.CostUsageChecked(r.Model, input, output,
+		usage.CacheCreationInputTokens, usage.CacheReadInputTokens)
+	if err != nil {
+		return r.Amount, input, output, false, true
+	}
+	return cost, input, output, true, false
+}
+
+func checkedUsageTokenSum(values ...int) (int, bool) {
+	total := 0
+	for _, value := range values {
+		if value < 0 || total > math.MaxInt-value {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
+}
+
+func safeTokenValue(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func newReservationID() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("生成 reservation ID 失败: %w", err)
+	}
+	return "res_" + hex.EncodeToString(buf[:]), nil
 }

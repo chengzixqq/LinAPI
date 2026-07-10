@@ -31,10 +31,7 @@ func (e *streamEncoder) Encode(event canonical.Event) ([]byte, error) {
 			Content: []block{},
 		}
 		if event.Usage != nil {
-			msg.Usage = &usage{
-				InputTokens:  event.Usage.InputTokens,
-				OutputTokens: event.Usage.OutputTokens,
-			}
+			msg.Usage = wireUsageFromCanonical(*event.Usage)
 		}
 		return sse("message_start", map[string]any{"type": "message_start", "message": msg})
 
@@ -70,7 +67,7 @@ func (e *streamEncoder) Encode(event canonical.Event) ([]byte, error) {
 			delta["stop_reason"] = mapStopReasonToWire(event.StopReason)
 		}
 		payload := map[string]any{"type": "message_delta", "delta": delta}
-		if event.Usage != nil {
+		if event.Usage != nil && event.Usage.OutputTokensKnown {
 			payload["usage"] = map[string]any{"output_tokens": event.Usage.OutputTokens}
 		}
 		return sse("message_delta", payload)

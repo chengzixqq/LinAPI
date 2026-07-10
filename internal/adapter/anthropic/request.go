@@ -13,6 +13,15 @@ func (a *Adapter) ParseRequest(raw []byte) (*canonical.Request, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, fmt.Errorf("anthropic: 解析请求失败: %w", err)
 	}
+	var limits struct {
+		MaxTokens *int `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(raw, &limits); err != nil {
+		return nil, fmt.Errorf("anthropic: 解析 max_tokens 失败: %w", err)
+	}
+	if limits.MaxTokens != nil && *limits.MaxTokens <= 0 {
+		return nil, fmt.Errorf("anthropic: max_tokens 必须为正数")
+	}
 
 	out := &canonical.Request{
 		Model:       req.Model,
@@ -22,8 +31,8 @@ func (a *Adapter) ParseRequest(raw []byte) (*canonical.Request, error) {
 		Stream:      req.Stream,
 		Metadata:    req.Metadata,
 	}
-	if req.MaxTokens > 0 {
-		mt := req.MaxTokens
+	if limits.MaxTokens != nil {
+		mt := *limits.MaxTokens
 		out.MaxTokens = &mt
 	}
 
@@ -76,25 +85,53 @@ func (a *Adapter) BuildRequest(req *canonical.Request) ([]byte, error) {
 		out.MaxTokens = 4096
 	}
 
-	// system 作为 block 数组输出（保留 cache_control 等信息）。
+	// system 作为 block 数组输出（保留 cache_control 等信息）。OpenAI 的有序
+	// system/developer 消息若位于会话正文之前，也按出现顺序并入此数组。
+	var systemBlocks []block
 	if len(req.System) > 0 {
-		var sys []block
 		for _, b := range req.System {
-			sys = append(sys, canonicalToBlock(b))
+			wire, err := canonicalToBlock(b)
+			if err != nil {
+				return nil, fmt.Errorf("anthropic: 编码 system block 失败: %w", err)
+			}
+			systemBlocks = append(systemBlocks, wire)
 		}
-		out.System = sys
 	}
 
+	conversationStarted := false
 	for _, m := range req.Messages {
-		role := "user"
-		if m.Role == canonical.RoleAssistant {
-			role = "assistant"
+		switch m.Role {
+		case canonical.RoleSystem, canonical.RoleDeveloper:
+			if conversationStarted {
+				return nil, fmt.Errorf("anthropic: 无法保留会话正文后的 %q 指令顺序", m.Role)
+			}
+			for _, b := range m.Content {
+				wire, err := canonicalToBlock(b)
+				if err != nil {
+					return nil, fmt.Errorf("anthropic: 编码 %s instruction block 失败: %w", m.Role, err)
+				}
+				systemBlocks = append(systemBlocks, wire)
+			}
+			continue
+		case canonical.RoleUser, canonical.RoleAssistant:
+			conversationStarted = true
+		default:
+			return nil, fmt.Errorf("anthropic: 无法构造角色 %q", m.Role)
 		}
+
+		role := string(m.Role)
 		msg := message{Role: role}
 		for _, b := range m.Content {
-			msg.Content = append(msg.Content, canonicalToBlock(b))
+			wire, err := canonicalToBlock(b)
+			if err != nil {
+				return nil, fmt.Errorf("anthropic: 编码 message block 失败: %w", err)
+			}
+			msg.Content = append(msg.Content, wire)
 		}
 		out.Messages = append(out.Messages, msg)
+	}
+	if len(systemBlocks) > 0 {
+		out.System = systemBlocks
 	}
 
 	for _, t := range req.Tools {

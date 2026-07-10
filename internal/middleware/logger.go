@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 )
@@ -72,7 +73,8 @@ func SetLogUsage(c *gin.Context, inputTokens, outputTokens int) {
 
 // RequestLogger 构建结构化访问日志中间件：
 //
-// 入口为每个请求分配 request_id（优先复用入站 X-Request-Id 头，便于跨服务串联），
+// 入口为每个请求分配服务端 request_id；不复用入站 X-Request-Id，避免攻击者用超长
+// 或高基数字段放大响应与日志。客户端相关 ID 应作为受限业务字段另行接入。
 // 注入 context 与响应头；收尾按状态码选级别（5xx→Error，4xx→Warn，其余→Info），
 // 输出方法 / 路径 / 状态 / 耗时 / 客户端 IP / 调用方身份，以及转发层回填的
 // model / channel / token 用量（缺失字段省略，避免噪声）。
@@ -87,10 +89,7 @@ func RequestLogger(logger *slog.Logger, skip ...string) gin.HandlerFunc {
 		skipSet[p] = struct{}{}
 	}
 	return func(c *gin.Context) {
-		rid := c.GetHeader(headerRequestID)
-		if rid == "" {
-			rid = newRequestID()
-		}
+		rid := newRequestID()
 		c.Set(ctxKeyRequestID, rid)
 		c.Header(headerRequestID, rid)
 
@@ -109,7 +108,7 @@ func RequestLogger(logger *slog.Logger, skip ...string) gin.HandlerFunc {
 		attrs := []slog.Attr{
 			slog.String("request_id", rid),
 			slog.String("method", c.Request.Method),
-			slog.String("path", c.Request.URL.Path),
+			slog.String("path", truncateLogValue(c.Request.URL.Path, 256)),
 			slog.Int("status", status),
 			slog.Float64("latency_ms", float64(time.Since(start).Microseconds())/1000.0),
 			slog.String("client_ip", c.ClientIP()),
@@ -146,8 +145,19 @@ func RequestLogger(logger *slog.Logger, skip ...string) gin.HandlerFunc {
 	}
 }
 
-// newRequestID 生成随机请求 ID。与转发层同风格（"req_" + hex），
-// 便于访问日志与计费用量日志按同一 ID 对账。
+func truncateLogValue(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut]
+}
+
+// newRequestID 生成随机链路 ID。计费另用内部 reservation ID 保证幂等，二者通过
+// billing_reservations.trace_id 关联，避免客户端复用 X-Request-Id 冲突账单。
 func newRequestID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

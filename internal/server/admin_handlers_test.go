@@ -169,7 +169,7 @@ func TestAdminKeyCreateEchoesPlaintextOnce(t *testing.T) {
 
 // TestAdminChannelSanitizesAPIKey 验证渠道读取端点脱敏上游 api_key。
 func TestAdminChannelSanitizesAPIKey(t *testing.T) {
-	e, _ := newAdminTestEngine(t)
+	e, svc := newAdminTestEngine(t)
 
 	body := gin.H{
 		"channel_id": "c1", "format": "openai", "base_url": "https://up.example",
@@ -183,11 +183,52 @@ func TestAdminChannelSanitizesAPIKey(t *testing.T) {
 	if bytes.Contains(w.Body.Bytes(), []byte("sk-secret-upstream")) {
 		t.Errorf("创建渠道响应不应回显上游 api_key")
 	}
+	if bytes.Contains(w.Body.Bytes(), []byte(`"api_key"`)) {
+		t.Errorf("创建渠道响应不应包含 api_key 字段")
+	}
 
 	// GET 也应脱敏。
 	w = doAdmin(t, e, http.MethodGet, "/admin/channels/c1", nil)
 	if bytes.Contains(w.Body.Bytes(), []byte("sk-secret-upstream")) {
 		t.Errorf("GET 渠道不应回显上游 api_key")
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte(`"api_key"`)) {
+		t.Errorf("GET 渠道不应包含 api_key 字段")
+	}
+
+	// 脱敏响应无法带回密钥；PUT 省略 api_key 时必须保留旧值而不是清空。
+	update := gin.H{
+		"channel_id": "c1",
+		"format":     "openai", "base_url": "https://up-v2.example",
+		"models": gin.H{"gpt-4o": ""}, "priority": 20, "weight": 1, "enabled": true,
+	}
+	w = doAdmin(t, e, http.MethodPut, "/admin/channels/c1", update)
+	if w.Code != http.StatusOK {
+		t.Fatalf("更新渠道应 200, 得到 %d; body=%s", w.Code, w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte(`"api_key"`)) {
+		t.Errorf("更新渠道响应不应包含 api_key 字段")
+	}
+	stored, err := svc.Store().GetChannel(context.Background(), "c1")
+	if err != nil || stored.APIKey != "sk-secret-upstream" {
+		t.Fatalf("省略 api_key 的更新必须保留旧密钥: key=%q err=%v", stored.APIKey, err)
+	}
+
+	// 显式提供新密钥时替换内部值，但响应仍不回显。
+	update["api_key"] = "sk-replaced-upstream"
+	w = doAdmin(t, e, http.MethodPut, "/admin/channels/c1", update)
+	if w.Code != http.StatusOK || bytes.Contains(w.Body.Bytes(), []byte("sk-replaced-upstream")) ||
+		bytes.Contains(w.Body.Bytes(), []byte(`"api_key"`)) {
+		t.Fatalf("显式替换密钥后响应必须保持脱敏: status=%d body=%s", w.Code, w.Body.String())
+	}
+	stored, err = svc.Store().GetChannel(context.Background(), "c1")
+	if err != nil || stored.APIKey != "sk-replaced-upstream" {
+		t.Fatalf("显式 api_key 未替换内部值: key=%q err=%v", stored.APIKey, err)
+	}
+
+	w = doAdmin(t, e, http.MethodGet, "/admin/channels", nil)
+	if bytes.Contains(w.Body.Bytes(), []byte(`"api_key"`)) {
+		t.Errorf("渠道列表不应包含 api_key 字段")
 	}
 
 	// 非法 format 应 400。

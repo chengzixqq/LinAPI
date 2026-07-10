@@ -1,6 +1,8 @@
 package anthropic
 
 import (
+	"encoding/json"
+
 	"linapi/internal/canonical"
 )
 
@@ -30,7 +32,7 @@ func blockToCanonical(b block) canonical.ContentBlock {
 		out.Type = canonical.BlockToolUse
 		out.ToolUseID = b.ID
 		out.ToolName = b.Name
-		out.ToolInput = b.Input
+		out.SetToolInputJSON(b.Input)
 
 	case "tool_result":
 		out.Type = canonical.BlockToolResult
@@ -43,7 +45,7 @@ func blockToCanonical(b block) canonical.ContentBlock {
 }
 
 // canonicalToBlock 把一个规范 content block 转为 Anthropic block。
-func canonicalToBlock(c canonical.ContentBlock) block {
+func canonicalToBlock(c canonical.ContentBlock) (block, error) {
 	out := block{}
 	if c.CacheControl {
 		out.CacheControl = &cacheControl{Type: "ephemeral"}
@@ -67,16 +69,24 @@ func canonicalToBlock(c canonical.ContentBlock) block {
 		out.Type = "tool_use"
 		out.ID = c.ToolUseID
 		out.Name = c.ToolName
-		out.Input = c.ToolInput
+		input, err := c.ToolInputBytes()
+		if err != nil {
+			return block{}, err
+		}
+		out.Input = input
 
 	case canonical.BlockToolResult:
 		out.Type = "tool_result"
 		out.ToolUseID = c.ToolResultID
 		out.IsError = c.ToolResultError
-		out.Content = canonicalToToolResultContent(c.ToolResult)
+		content, err := canonicalToToolResultContent(c.ToolResult)
+		if err != nil {
+			return block{}, err
+		}
+		out.Content = content
 	}
 
-	return out
+	return out, nil
 }
 
 func imageSourceToCanonical(s *imageSource) *canonical.ImageSource {
@@ -112,18 +122,19 @@ func toolResultContentToCanonical(content any) []canonical.ContentBlock {
 	case []any:
 		var blocks []canonical.ContentBlock
 		for _, item := range v {
-			m, ok := item.(map[string]any)
-			if !ok {
+			raw, err := json.Marshal(item)
+			if err != nil {
 				continue
 			}
-			// 仅处理 text / image 两类常见结果内容。
-			switch m["type"] {
-			case "text":
-				if t, ok := m["text"].(string); ok {
-					blocks = append(blocks, canonical.ContentBlock{Type: canonical.BlockText, Text: t})
-				}
-			case "image":
-				blocks = append(blocks, canonical.ContentBlock{Type: canonical.BlockImage})
+			var wire block
+			if err := json.Unmarshal(raw, &wire); err != nil {
+				continue
+			}
+			// tool_result 当前只支持 text/image；走统一 block 转换以复用完整
+			// image source 映射，避免 URL/base64 内容被丢成空图片块。
+			switch wire.Type {
+			case "text", "image":
+				blocks = append(blocks, blockToCanonical(wire))
 			}
 		}
 		return blocks
@@ -133,13 +144,17 @@ func toolResultContentToCanonical(content any) []canonical.ContentBlock {
 
 // canonicalToToolResultContent 把规范 block 列表还原为 tool_result content。
 // 纯文本时用字符串（Claude 更常见），否则用 block 数组。
-func canonicalToToolResultContent(blocks []canonical.ContentBlock) any {
+func canonicalToToolResultContent(blocks []canonical.ContentBlock) (any, error) {
 	if len(blocks) == 1 && blocks[0].Type == canonical.BlockText {
-		return blocks[0].Text
+		return blocks[0].Text, nil
 	}
 	var out []block
 	for _, b := range blocks {
-		out = append(out, canonicalToBlock(b))
+		wire, err := canonicalToBlock(b)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, wire)
 	}
-	return out
+	return out, nil
 }

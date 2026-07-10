@@ -16,6 +16,9 @@ func (a *Adapter) ParseResponse(raw []byte) (*canonical.Response, error) {
 	if len(resp.Choices) == 0 {
 		return nil, fmt.Errorf("openai: 响应不含 choices")
 	}
+	if len(resp.Choices) != 1 || resp.Choices[0].Index != 0 {
+		return nil, fmt.Errorf("openai: n=1 请求收到异常的多 choice/index 响应")
+	}
 
 	ch := resp.Choices[0]
 	out := &canonical.Response{
@@ -36,28 +39,20 @@ func (a *Adapter) ParseResponse(raw []byte) (*canonical.Response, error) {
 
 	// tool_calls → tool_use blocks
 	for _, tc := range ch.Message.ToolCalls {
-		var input map[string]any
-		if tc.Function.Arguments != "" {
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
-				return nil, fmt.Errorf("openai: 解析响应工具参数失败: %w", err)
-			}
-		}
-		out.Content = append(out.Content, canonical.ContentBlock{
+		block := canonical.ContentBlock{
 			Type:      canonical.BlockToolUse,
 			ToolUseID: tc.ID,
 			ToolName:  tc.Function.Name,
-			ToolInput: input,
-		})
+		}
+		block.SetToolInputJSON([]byte(tc.Function.Arguments))
+		out.Content = append(out.Content, block)
 	}
 
 	if ch.FinishReason != nil {
 		out.StopReason = mapFinishReasonToCanonical(*ch.FinishReason)
 	}
-	if resp.Usage != nil {
-		out.Usage = canonical.Usage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-		}
+	if usage := canonicalUsageFromWire(resp.Usage); usage != nil {
+		out.Usage = *usage
 	}
 
 	return out, nil
@@ -73,9 +68,9 @@ func (a *Adapter) BuildResponse(resp *canonical.Response) ([]byte, error) {
 		case canonical.BlockText:
 			text += b.Text
 		case canonical.BlockToolUse:
-			args, _ := json.Marshal(b.ToolInput)
-			if b.ToolInput == nil {
-				args = []byte("{}")
+			args, err := b.ToolInputBytes()
+			if err != nil {
+				return nil, fmt.Errorf("openai: 编码响应工具参数失败: %w", err)
 			}
 			msg.ToolCalls = append(msg.ToolCalls, toolCall{
 				ID:       b.ToolUseID,
@@ -94,11 +89,7 @@ func (a *Adapter) BuildResponse(resp *canonical.Response) ([]byte, error) {
 		Object:  "chat.completion",
 		Model:   resp.Model,
 		Choices: []choice{{Index: 0, Message: msg, FinishReason: &finish}},
-		Usage: &usage{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.TotalTokens(),
-		},
+		Usage:   wireUsageFromCanonical(resp.Usage),
 	}
 	return json.Marshal(out)
 }

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -101,10 +102,36 @@ func TestBalance(t *testing.T) {
 func TestAddBalance(t *testing.T) {
 	s := newTestStore()
 
-	if got := s.AddBalance("alice", -300); got != 700 {
+	if got, err := s.AddBalance("alice", -300); err != nil || got != 700 {
 		t.Errorf("扣费后余额应为 700, 得到 %d", got)
 	}
-	if got := s.AddBalance("alice", 50); got != 750 {
+	if got, err := s.AddBalance("alice", 50); err != nil || got != 750 {
 		t.Errorf("充值后余额应为 750, 得到 %d", got)
+	}
+}
+
+func TestAddBalanceRejectsOverflow(t *testing.T) {
+	s := NewMemoryStore([]KeySeed{{APIKey: "sk-max", KeyID: "k-max", UserID: "max", Enabled: true, InitialBalance: math.MaxInt64}})
+	if got, err := s.AddBalance("max", 1); !errors.Is(err, ErrBalanceOverflow) || got != math.MaxInt64 {
+		t.Fatalf("溢出应被拒绝且余额不变，got=%d err=%v", got, err)
+	}
+}
+
+func TestNewMemoryStoreRejectsDuplicateKeyBindings(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("重复明文 API Key 必须在启动时失败")
+		}
+	}()
+	_ = NewMemoryStore([]KeySeed{
+		{APIKey: "same", KeyID: "k1", UserID: "u1"},
+		{APIKey: "same", KeyID: "k2", UserID: "u2"},
+	})
+}
+
+func TestAdminCreateKeyRejectsDuplicatePlaintext(t *testing.T) {
+	s := newTestStore()
+	if _, err := s.AdminCreateKey("sk-alice", "new-id", "bob", 60, nil, true); !errors.Is(err, ErrKeyExists) {
+		t.Fatalf("重复明文 API Key 应返回 ErrKeyExists，得到 %v", err)
 	}
 }

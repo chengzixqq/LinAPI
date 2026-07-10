@@ -16,10 +16,11 @@ import (
 //     0/负数会被限流层解释为“不限流”，超大值可绕过平台限流，一律在建 key 前拒绝。
 //   - 每账户 key 数量不得超过 maxSelfKeysPerAccount，防止批量建 key 线性叠加配额、
 //     撑爆存储与 O(n) 归属检查。
+//
 // 管理面（/admin）的建 key 不受此限——面向运维，可为渠道/系统账户放宽。
 const (
 	minSelfKeyRateLimit   = 1
-	maxSelfKeyRateLimit   = 5000
+	maxSelfKeyRateLimit   = admin.MaxRateLimitPerMin
 	maxSelfKeysPerAccount = 50
 )
 
@@ -119,30 +120,19 @@ func (h *meHandlers) createKey(c *gin.Context) {
 			"rate_limit_per_min 必须在 1 到 5000 之间")
 		return
 	}
-	// 每账户 key 数量硬上限：防止批量建 key 线性叠加配额、撑爆存储。
-	existing, err := h.svc.Store().ListAPIKeysByUser(c.Request.Context(), ext)
-	if err != nil {
-		writeError(c, http.StatusInternalServerError, "internal_error", "读取密钥失败")
-		return
-	}
-	if len(existing) >= maxSelfKeysPerAccount {
-		writeError(c, http.StatusConflict, "conflict",
-			"已达每账户密钥数量上限（50），请删除不用的密钥后重试")
-		return
-	}
 	gen, err := admin.GenerateKey()
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "internal_error", "生成密钥失败")
 		return
 	}
-	k, err := h.svc.Store().CreateAPIKey(c.Request.Context(), admin.CreateAPIKeyInput{
+	k, err := h.svc.CreateAPIKeyLimited(c.Request.Context(), admin.CreateAPIKeyInput{
 		APIKey:          gen.APIKey,
 		KeyID:           gen.KeyID,
 		UserID:          ext, // 强制绑定会话用户。
 		RateLimitPerMin: req.RateLimitPerMin,
 		AllowedModels:   req.AllowedModels,
 		Enabled:         true,
-	})
+	}, maxSelfKeysPerAccount)
 	if err != nil {
 		writeAdminError(c, err)
 		return
@@ -169,7 +159,7 @@ func (h *meHandlers) setKeyEnabled(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
 		return
 	}
-	k, err := h.svc.Store().SetAPIKeyEnabled(c.Request.Context(), keyID, req.Enabled)
+	k, err := h.svc.Store().SetAPIKeyEnabled(c.Request.Context(), keyID, *req.Enabled)
 	if err != nil {
 		writeAdminError(c, err)
 		return

@@ -1,5 +1,7 @@
 # LinAPI 管理控制台 — 前端实现计划（Plan 2/2）
 
+> **状态（2026-07-11）**：Plan 1 后端已实现；Plan 2 前端尚未启动。本文件是待执行的前端计划，当前后端接口与安全边界以 [`../../progress.md`](../../progress.md) 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **前置依赖：** 本计划依赖 Plan 1（后端认证层）已完成——`/auth`、`/me`、`/admin/accounts`、`/admin/settings` 端点可用，`/admin/*` 已切换会话鉴权。

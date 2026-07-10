@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"linapi/internal/billing"
+	"linapi/internal/canonical"
 	"linapi/internal/routing"
 )
 
@@ -61,6 +63,131 @@ func TestForwardStreamSameFormat(t *testing.T) {
 		bal, ok := env.balanceOf(t, "u-test")
 		return ok && bal == 1_000_000-26
 	}, time.Second)
+}
+
+// TestForwardStreamMissingFinalUsageChargesFullReservation 验证协议正常结束但上游
+// 没有返回最终 usage 时，不能按 0 token 结算或退款，必须扣满预授权。
+func TestForwardStreamMissingFinalUsageChargesFullReservation(t *testing.T) {
+	const chunks = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	up := mockUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, chunks)
+	})
+
+	const initialBalance int64 = 1_000_000
+	env := newTestEnv(t, []*routing.Channel{openAIChannel("c1", up.URL, 10)}, initialBalance)
+	w := env.doRequest(http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "[DONE]") {
+		t.Fatalf("客户端应收到完整流，status=%d body=%s", w.Code, w.Body.String())
+	}
+	assertStreamBalance(t, env, initialBalance-streamFullReservationCost())
+}
+
+// TestForwardStreamMissingTerminalChargesFullReservation 验证即使最终 usage 完整，
+// 缺少协议结束事件的提前 EOF 仍不得按该 usage 精确结算或自动退款。
+func TestForwardStreamMissingTerminalChargesFullReservation(t *testing.T) {
+	truncated := strings.TrimSuffix(openAIStreamChunks, "data: [DONE]\n\n")
+	up := mockUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, truncated)
+	})
+
+	const initialBalance int64 = 1_000_000
+	env := newTestEnv(t, []*routing.Channel{openAIChannel("c1", up.URL, 10)}, initialBalance)
+	w := env.doRequest(http.MethodPost, "/v1/chat/completions",
+		`{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("流已提交后应保持 200 并截断，status=%d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "[DONE]") {
+		t.Fatalf("测试上游不应产生结束标记: %s", w.Body.String())
+	}
+	assertStreamBalance(t, env, initialBalance-streamFullReservationCost())
+}
+
+// TestForwardStreamErrorEventChargesFullReservation 验证 HTTP 2xx 内的 Anthropic
+// error 事件是已消费的异常终态：转发错误事件，但资金按预授权上限结算。
+func TestForwardStreamErrorEventChargesFullReservation(t *testing.T) {
+	const chunks = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":7}}}\n\n" +
+		"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"stream failed\"}}\n\n"
+
+	up := mockUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, chunks)
+	})
+	ch := &routing.Channel{
+		ID:       "ant",
+		Format:   routing.FormatAnthropic,
+		BaseURL:  up.URL,
+		APIKey:   "sk-upstream",
+		Models:   map[string]string{"claude": ""},
+		Priority: 10,
+		Weight:   1,
+		Enabled:  true,
+	}
+
+	const initialBalance int64 = 1_000_000
+	env := newTestEnv(t, []*routing.Channel{ch}, initialBalance)
+	w := env.doRequest(http.MethodPost, "/v1/messages",
+		`{"model":"claude","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "stream failed") {
+		t.Fatalf("客户端应收到上游 error 事件，status=%d body=%s", w.Code, w.Body.String())
+	}
+	assertStreamBalance(t, env, initialBalance-streamFullReservationCost())
+}
+
+func TestForwardStreamFinalUsageCannotBorrowProvisionalOutput(t *testing.T) {
+	const chunks = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	up := mockUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, chunks)
+	})
+	ch := &routing.Channel{
+		ID: "ant", Format: routing.FormatAnthropic, BaseURL: up.URL, APIKey: "sk-upstream",
+		Models: map[string]string{"claude": ""}, Priority: 10, Weight: 1, Enabled: true,
+	}
+	env := newTestEnv(t, []*routing.Channel{ch}, 1_000_000)
+	w := env.doRequest(http.MethodPost, "/v1/messages",
+		`{"model":"claude","max_tokens":4,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if bal, _ := env.balanceOf(t, "u-test"); bal != 1_000_000-128_008 {
+		t.Fatalf("残缺 final usage 必须扣满预授权，余额=%d", bal)
+	}
+}
+
+func TestForwardStreamContentAfterFinalUsageChargesFullReservation(t *testing.T) {
+	const chunks = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":7}}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	up := mockUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, chunks)
+	})
+	ch := &routing.Channel{
+		ID: "ant", Format: routing.FormatAnthropic, BaseURL: up.URL, APIKey: "sk-upstream",
+		Models: map[string]string{"claude": ""}, Priority: 10, Weight: 1, Enabled: true,
+	}
+	const initialBalance int64 = 1_000_000
+	env := newTestEnv(t, []*routing.Channel{ch}, initialBalance)
+	w := env.doRequest(http.MethodPost, "/v1/messages",
+		`{"model":"claude","max_tokens":4,"stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	assertStreamBalance(t, env, initialBalance-128_008)
 }
 
 // TestForwardStreamCrossFormat OpenAI 客户端 → Anthropic 上游流式（跨格式转换）。
@@ -155,7 +282,7 @@ func TestForwardStreamCountsChunks(t *testing.T) {
 // 这覆盖了「提交点与 committed 标志一致」的修复：首块之前的失败仍可换渠道。
 func TestForwardStreamFailover(t *testing.T) {
 	bad := mockUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
+		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = io.WriteString(w, `{"error":{"message":"unavailable"}}`)
 	})
 	good := mockUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -221,5 +348,127 @@ func TestForwardStreamPassthroughVerbatim(t *testing.T) {
 	waitFor(t, func() bool {
 		bal, ok := env.balanceOf(t, "u-test")
 		return ok && bal == 1_000_000-26
+	}, time.Second)
+}
+
+func TestAccumulateUsageMergesPresenceAndCumulativeValues(t *testing.T) {
+	var got canonical.Usage
+	accumulateUsage(&got, canonical.Event{Usage: &canonical.Usage{
+		InputTokens: 7, InputTokensKnown: true,
+		OutputTokens: 1, OutputTokensKnown: true,
+		CacheCreationInputTokens: 2,
+		CacheReadInputTokens:     3,
+	}})
+	accumulateUsage(&got, canonical.Event{Usage: &canonical.Usage{
+		OutputTokens: 4, OutputTokensKnown: true,
+		ReportedTotalTokens: 11, TotalTokensKnown: true,
+		CacheCreationInputTokens: 5,
+		CacheReadInputTokens:     1,
+	}})
+
+	if got.InputTokens != 7 || !got.InputTokensKnown ||
+		got.OutputTokens != 4 || !got.OutputTokensKnown ||
+		got.ReportedTotalTokens != 11 || !got.TotalTokensKnown ||
+		got.CacheCreationInputTokens != 5 || got.CacheReadInputTokens != 3 {
+		t.Fatalf("usage 累计错误: %+v", got)
+	}
+}
+
+func TestAccumulateUsagePreservesInvalidCacheValues(t *testing.T) {
+	got := canonical.Usage{InputTokensKnown: true, OutputTokensKnown: true}
+	accumulateUsage(&got, canonical.Event{Usage: &canonical.Usage{CacheReadInputTokens: -1}})
+	accumulateUsage(&got, canonical.Event{Usage: &canonical.Usage{CacheReadInputTokens: 20}})
+	if got.CacheReadInputTokens != -1 || usageReadyForExactSettlement(got) {
+		t.Fatalf("非法缓存 usage 必须保持失效，不能被后续值覆盖: %+v", got)
+	}
+}
+
+func TestUsageWithFinalAuthorityDoesNotUseProvisionalOutput(t *testing.T) {
+	aggregate := canonical.Usage{
+		InputTokens: 7, InputTokensKnown: true,
+		OutputTokens: 1, OutputTokensKnown: true,
+	}
+	got := usageWithFinalAuthority(aggregate, canonical.Usage{})
+	if got.OutputTokensKnown || usageReadyForExactSettlement(got) {
+		t.Fatalf("残缺最终 usage 不得被早期 output 补齐: %+v", got)
+	}
+
+	final := canonical.Usage{OutputTokens: 4, OutputTokensKnown: true}
+	got = usageWithFinalAuthority(aggregate, final)
+	if !usageReadyForExactSettlement(got) || got.OutputTokens != 4 {
+		t.Fatalf("最终 output 应覆盖临时值并可精确结算: %+v", got)
+	}
+}
+
+func TestUsageReadyForExactSettlement(t *testing.T) {
+	tests := []struct {
+		name  string
+		usage canonical.Usage
+		want  bool
+	}{
+		{
+			name: "双边完整",
+			usage: canonical.Usage{
+				InputTokens: 10, InputTokensKnown: true,
+				OutputTokens: 5, OutputTokensKnown: true,
+			},
+			want: true,
+		},
+		{
+			name: "total 加单边可推导",
+			usage: canonical.Usage{
+				InputTokens: 10, InputTokensKnown: true,
+				ReportedTotalTokens: 15, TotalTokensKnown: true,
+			},
+			want: true,
+		},
+		{
+			name:  "完全缺失",
+			usage: canonical.Usage{},
+		},
+		{
+			name: "只有 total",
+			usage: canonical.Usage{
+				ReportedTotalTokens: 15, TotalTokensKnown: true,
+			},
+		},
+		{
+			name: "total 冲突",
+			usage: canonical.Usage{
+				InputTokens: 10, InputTokensKnown: true,
+				OutputTokens: 5, OutputTokensKnown: true,
+				ReportedTotalTokens: 99, TotalTokensKnown: true,
+			},
+		},
+		{
+			name: "负缓存 token",
+			usage: canonical.Usage{
+				InputTokens: 10, InputTokensKnown: true,
+				OutputTokens: 5, OutputTokensKnown: true,
+				CacheReadInputTokens: -1,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := usageReadyForExactSettlement(tt.usage); got != tt.want {
+				t.Fatalf("usageReadyForExactSettlement() = %v，期望 %v；usage=%+v", got, tt.want, tt.usage)
+			}
+		})
+	}
+}
+
+func streamFullReservationCost() int64 {
+	// 测试 Pricing 的兜底单价为 input=1/token、output=2/token。
+	return int64(billing.DefaultMaxBillableInputTokens) +
+		2*int64(billing.DefaultMaxOutputTokens)
+}
+
+func assertStreamBalance(t *testing.T, env *testEnv, want int64) {
+	t.Helper()
+	waitFor(t, func() bool {
+		balance, ok := env.balanceOf(t, "u-test")
+		return ok && balance == want
 	}, time.Second)
 }

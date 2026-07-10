@@ -1,6 +1,9 @@
 package account
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestHashAndCheckPassword(t *testing.T) {
 	hash, err := HashPassword("s3cret-pw")
@@ -21,5 +24,23 @@ func TestHashAndCheckPassword(t *testing.T) {
 func TestHashPasswordTooShort(t *testing.T) {
 	if _, err := HashPassword("short"); err != ErrPasswordTooShort {
 		t.Fatalf("短密码应返回 ErrPasswordTooShort, 得到 %v", err)
+	}
+}
+
+func TestHashPasswordCountsUnicodeCharacters(t *testing.T) {
+	if _, err := HashPassword("中文中文中文中"); err != ErrPasswordTooShort {
+		t.Fatalf("7 个字符应过短，得到 %v", err)
+	}
+	if _, err := HashPassword("中文中文中文中文"); err != nil {
+		t.Fatalf("8 个字符且不超过 72 字节应可用，得到 %v", err)
+	}
+}
+
+func TestHashPasswordRejectsBcryptOverflow(t *testing.T) {
+	if _, err := HashPassword(strings.Repeat("a", MaxPasswordBytes+1)); err != ErrPasswordTooLong {
+		t.Fatalf("超过 72 字节应返回 ErrPasswordTooLong，得到 %v", err)
+	}
+	if _, err := HashPassword(strings.Repeat("a", MaxPasswordBytes)); err != nil {
+		t.Fatalf("72 字节边界应可用，得到 %v", err)
 	}
 }

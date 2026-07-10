@@ -58,10 +58,27 @@ type Breaker struct {
 	consecutiveFail int
 	openedAt        time.Time
 	halfOpenProbes  int
+	generation      uint64
 
 	// now 便于测试注入时钟；生产为 time.Now。
 	now func() time.Time
 }
+
+// BreakerPermit 表示一次已经获准发起的上游尝试。结果必须通过该许可回报，
+// 这样旧请求的迟到结果就不会修改后续代际的熔断状态。
+type BreakerPermit struct {
+	breaker    *Breaker
+	generation uint64
+	once       sync.Once
+}
+
+type breakerResult uint8
+
+const (
+	breakerSuccess breakerResult = iota
+	breakerFailure
+	breakerNeutral
+)
 
 // NewBreaker 创建熔断器。
 func NewBreaker(cfg BreakerConfig) *Breaker {
@@ -77,66 +94,100 @@ func NewBreaker(cfg BreakerConfig) *Breaker {
 	return &Breaker{cfg: cfg, state: StateClosed, now: time.Now}
 }
 
-// Allow 返回当前是否允许放行一个请求。
+// Allow 返回当前是否允许放行一个请求，并给出绑定本次尝试的许可。
 // 有副作用：Open 冷却期满时会转入 HalfOpen 并放行探测；
 // HalfOpen 下按 HalfOpenMaxProbes 限制并发探测数。
 // 应在“真正发起一次尝试之前”调用，且随后必须配对调用
-// RecordSuccess 或 RecordFailure，否则半开探测额度不会释放。
-func (b *Breaker) Allow() bool {
+// BreakerPermit 的结果方法，否则半开探测额度不会释放。
+func (b *Breaker) Allow() (*BreakerPermit, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	switch b.state {
 	case StateClosed:
-		return true
+		return b.newPermit(), true
 	case StateOpen:
 		if b.now().Sub(b.openedAt) >= b.cfg.CooldownPeriod {
 			// 冷却期满，进入半开并放行首个探测。
 			b.state = StateHalfOpen
+			b.generation++
 			b.halfOpenProbes = 1
-			return true
+			return b.newPermit(), true
 		}
-		return false
+		return nil, false
 	case StateHalfOpen:
 		if b.halfOpenProbes < b.cfg.HalfOpenMaxProbes {
 			b.halfOpenProbes++
-			return true
+			return b.newPermit(), true
 		}
-		return false
+		return nil, false
 	}
-	return false
+	return nil, false
 }
 
-// RecordSuccess 上报一次成功。
-func (b *Breaker) RecordSuccess() {
+func (b *Breaker) newPermit() *BreakerPermit {
+	return &BreakerPermit{breaker: b, generation: b.generation}
+}
+
+// RecordSuccess 记录该次获准尝试成功。
+func (p *BreakerPermit) RecordSuccess() {
+	p.resolve(breakerSuccess)
+}
+
+// RecordFailure 记录该次获准尝试失败。
+func (p *BreakerPermit) RecordFailure() {
+	p.resolve(breakerFailure)
+}
+
+// RecordNeutral 结束该次尝试但不将其计为渠道成功或失败。
+// 典型场景是客户端取消请求；HalfOpen 下仍需释放占用的探测名额。
+func (p *BreakerPermit) RecordNeutral() {
+	p.resolve(breakerNeutral)
+}
+
+func (p *BreakerPermit) resolve(result breakerResult) {
+	if p == nil || p.breaker == nil {
+		return
+	}
+	p.once.Do(func() {
+		p.breaker.record(p.generation, result)
+	})
+}
+
+func (b *Breaker) record(generation uint64, result breakerResult) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.consecutiveFail = 0
-	switch b.state {
-	case StateHalfOpen:
-		// 探测成功，恢复正常。
-		b.state = StateClosed
-		b.halfOpenProbes = 0
-	case StateOpen:
-		// 理论上不该在 Open 放行请求，兜底恢复。
-		b.state = StateClosed
+	// 许可创建后，熔断器可能已因另一个并发请求推进到新代际。
+	// 旧代际的迟到结果不能再覆盖当前状态。
+	if generation != b.generation {
+		return
 	}
-}
 
-// RecordFailure 上报一次失败。
-func (b *Breaker) RecordFailure() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	switch b.state {
-	case StateHalfOpen:
-		// 半开探测失败，立即重新熔断。
-		b.trip()
-	case StateClosed:
-		b.consecutiveFail++
-		if b.consecutiveFail >= b.cfg.FailureThreshold {
+	switch result {
+	case breakerSuccess:
+		switch b.state {
+		case StateClosed:
+			b.consecutiveFail = 0
+		case StateHalfOpen:
+			b.consecutiveFail = 0
+			b.state = StateClosed
+			b.halfOpenProbes = 0
+			b.generation++
+		}
+	case breakerFailure:
+		switch b.state {
+		case StateHalfOpen:
 			b.trip()
+		case StateClosed:
+			b.consecutiveFail++
+			if b.consecutiveFail >= b.cfg.FailureThreshold {
+				b.trip()
+			}
+		}
+	case breakerNeutral:
+		if b.state == StateHalfOpen && b.halfOpenProbes > 0 {
+			b.halfOpenProbes--
 		}
 	}
 }
@@ -146,6 +197,7 @@ func (b *Breaker) trip() {
 	b.state = StateOpen
 	b.openedAt = b.now()
 	b.halfOpenProbes = 0
+	b.generation++
 }
 
 // Ready 是无副作用的准入预判：返回该渠道当前是否“有可能”放行，

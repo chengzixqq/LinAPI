@@ -43,6 +43,7 @@ func (q *Queries) GetBalance(ctx context.Context, externalID string) (int64, err
 const addBalance = `-- name: AddBalance :one
 UPDATE users
 SET balance = balance + $2,
+	 balance_version = balance_version + 1,
     updated_at = now()
 WHERE external_id = $1
 RETURNING balance

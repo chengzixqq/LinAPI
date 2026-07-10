@@ -6,9 +6,10 @@ import (
 
 // User 对应 users 表。balance 按 sqlc.yaml 的 override 映射为 int64（最小计费单位）。
 type User struct {
-	ID         int64  `json:"id"`
-	ExternalID string `json:"external_id"`
-	Balance    int64  `json:"balance"`
+	ID             int64  `json:"id"`
+	ExternalID     string `json:"external_id"`
+	Balance        int64  `json:"balance"`
+	BalanceVersion int64  `json:"balance_version"`
 	// RateMultiplier 是预留的单用户定价倍率（百分比，100=1.00x）；本期存而不用，
 	// 现有查询不 select 该列，故此字段暂不参与任何 Scan。
 	RateMultiplier int32              `json:"rate_multiplier"`
@@ -48,16 +49,62 @@ type Channel struct {
 
 // UsageLog 对应 usage_logs 表。cost 按 override 映射为 int64（最小计费单位）。
 type UsageLog struct {
-	ID           int64              `json:"id"`
-	RequestID    string             `json:"request_id"`
-	UserID       string             `json:"user_id"`
-	KeyID        string             `json:"key_id"`
-	Model        string             `json:"model"`
-	Channel      string             `json:"channel"`
-	InputTokens  int32              `json:"input_tokens"`
-	OutputTokens int32              `json:"output_tokens"`
-	Cost         int64              `json:"cost"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	ID                       int64              `json:"id"`
+	RequestID                string             `json:"request_id"`
+	UserID                   string             `json:"user_id"`
+	KeyID                    string             `json:"key_id"`
+	Model                    string             `json:"model"`
+	Channel                  string             `json:"channel"`
+	InputTokens              int32              `json:"input_tokens"`
+	OutputTokens             int32              `json:"output_tokens"`
+	CacheCreationInputTokens int32              `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int32              `json:"cache_read_input_tokens"`
+	ReportedTotalTokens      int32              `json:"reported_total_tokens"`
+	Cost                     int64              `json:"cost"`
+	UsageComplete            bool               `json:"usage_complete"`
+	Estimated                bool               `json:"estimated"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+}
+
+// BillingReservation 对应 billing_reservations：状态与消费事实持久化后，进程
+// 崩溃可继续完成 consumed_unsettled 结算。
+type BillingReservation struct {
+	ReservationID            string             `json:"reservation_id"`
+	TraceID                  string             `json:"trace_id"`
+	UserID                   string             `json:"user_id"`
+	KeyID                    string             `json:"key_id"`
+	Model                    string             `json:"model"`
+	Amount                   int64              `json:"amount"`
+	MaxInputTokens           int32              `json:"max_input_tokens"`
+	MaxOutputTokens          int32              `json:"max_output_tokens"`
+	Status                   string             `json:"status"`
+	Channel                  string             `json:"channel"`
+	InputTokens              int32              `json:"input_tokens"`
+	OutputTokens             int32              `json:"output_tokens"`
+	CacheCreationInputTokens int32              `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int32              `json:"cache_read_input_tokens"`
+	ReportedTotalTokens      int32              `json:"reported_total_tokens"`
+	Cost                     int64              `json:"cost"`
+	UsageComplete            bool               `json:"usage_complete"`
+	Estimated                bool               `json:"estimated"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	ConsumedAt               pgtype.Timestamptz `json:"consumed_at"`
+	SettledAt                pgtype.Timestamptz `json:"settled_at"`
+	RefundedAt               pgtype.Timestamptz `json:"refunded_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+}
+
+// BillingLedger 对应 billing_ledger 的只追加资金流水。
+type BillingLedger struct {
+	ID             int64              `json:"id"`
+	OperationID    string             `json:"operation_id"`
+	ReservationID  string             `json:"reservation_id"`
+	UserID         string             `json:"user_id"`
+	Kind           string             `json:"kind"`
+	Amount         int64              `json:"amount"`
+	BalanceAfter   int64              `json:"balance_after"`
+	BalanceVersion int64              `json:"balance_version"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
 // Account 对应 accounts 表：控制台登录账户（与计费实体 users 分离）。

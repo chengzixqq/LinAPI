@@ -54,9 +54,9 @@ func (m *MemoryStore) CreateUserAccount(_ context.Context, username, passwordHas
 	return m.insertLocked(username, passwordHash, RoleUser, username), nil
 }
 
-// CreateAccount 直接建账户（bootstrap 建 admin，不连带计费实体）。
+// CreateAccount 直接建管理员账户（bootstrap 用）；user 必须走 CreateUserAccount。
 func (m *MemoryStore) CreateAccount(_ context.Context, in CreateAccountInput) (Account, error) {
-	if !ValidRole(in.Role) {
+	if in.Role != RoleAdmin || in.ExternalID != "" {
 		return Account{}, ErrInvalidRole
 	}
 	m.mu.Lock()

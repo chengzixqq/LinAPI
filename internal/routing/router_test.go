@@ -87,7 +87,7 @@ func TestSelectSkipsOpenBreaker(t *testing.T) {
 	if aBreaker == nil {
 		t.Fatal("未取到 a 的熔断器")
 	}
-	aBreaker.RecordFailure() // 阈值 1，立即熔断
+	mustAllow(t, aBreaker).RecordFailure() // 阈值 1，立即熔断
 
 	// 之后 Select 应只剩 b
 	for i := 0; i < 10; i++ {
@@ -109,7 +109,7 @@ func TestSelectSkipsOpenBreaker(t *testing.T) {
 func TestSelectAllOpenReturnsError(t *testing.T) {
 	r := NewRouter([]*Channel{ch("a", 5, 1, "gpt-4o")}, BreakerConfig{FailureThreshold: 1, CooldownPeriod: time.Minute})
 	cands, _ := r.Select("gpt-4o")
-	cands[0].Breaker.RecordFailure()
+	mustAllow(t, cands[0].Breaker).RecordFailure()
 	if _, err := r.Select("gpt-4o"); err != ErrNoChannel {
 		t.Errorf("全熔断应返回 ErrNoChannel, 得到 %v", err)
 	}
@@ -119,7 +119,7 @@ func TestSelectAllOpenReturnsError(t *testing.T) {
 func TestUpdateChannelsPreservesBreaker(t *testing.T) {
 	r := NewRouter([]*Channel{ch("a", 5, 1, "gpt-4o")}, BreakerConfig{FailureThreshold: 1, CooldownPeriod: time.Minute})
 	cands, _ := r.Select("gpt-4o")
-	cands[0].Breaker.RecordFailure() // 熔断 a
+	mustAllow(t, cands[0].Breaker).RecordFailure() // 熔断 a
 
 	// 热更新：a 仍在，新增 b
 	r.UpdateChannels([]*Channel{

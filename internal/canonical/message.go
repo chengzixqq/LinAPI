@@ -6,14 +6,19 @@
 // 丢失 thinking、结构化工具调用、多模态 block 等信息。
 package canonical
 
+import (
+	"bytes"
+	"encoding/json"
+)
+
 // Request 是一次对话补全请求的规范表示。
 type Request struct {
 	// Model 是客户端请求的模型名（如 "gpt-4o"、"claude-3-5-sonnet"）。
 	// 路由层据此选择渠道，适配器再映射为上游实际模型名。
 	Model string
 
-	// System 是系统提示。各家表达不同（OpenAI 放在 messages 里，
-	// Claude 是顶层字段），规范模型统一提到顶层。
+	// System 是没有独立消息顺序语义的顶层系统提示（如 Anthropic system）。
+	// OpenAI 的 system/developer 消息保存在 Messages 中，避免提升后改变顺序。
 	System []ContentBlock
 
 	// Messages 是对话消息序列。
@@ -43,9 +48,12 @@ type Request struct {
 type Role string
 
 const (
+	RoleSystem    Role = "system"
+	RoleDeveloper Role = "developer"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
-	// 注意：System 不作为消息角色，统一提升到 Request.System。
+	// 顶层 Request.System 与有序 RoleSystem 并存：前者表示供应商原生顶层
+	// 指令，后者保留 OpenAI messages 中的真实位置。
 	// Tool 结果作为 user 消息里的 ToolResult block 承载（对齐 Claude 结构）。
 )
 
@@ -82,9 +90,10 @@ type ContentBlock struct {
 	ThinkingSignature string
 
 	// BlockToolUse：模型请求调用工具
-	ToolUseID string         // 本次调用的唯一 ID
-	ToolName  string         // 被调用的工具名
-	ToolInput map[string]any // 调用参数
+	ToolUseID     string          // 本次调用的唯一 ID
+	ToolName      string          // 被调用的工具名
+	ToolInput     map[string]any  // 调用参数的对象视图（数字使用 json.Number）
+	ToolInputJSON json.RawMessage // 调用参数原始 JSON；优先用于跨格式重编码
 
 	// BlockToolResult：工具执行结果
 	ToolResultID    string         // 对应的 ToolUseID
@@ -93,6 +102,47 @@ type ContentBlock struct {
 
 	// CacheControl 标记该 block 参与提示缓存（如 Claude prompt caching）。
 	CacheControl bool
+}
+
+// SetToolInputJSON 保存工具参数的原始 JSON，并在它是完整 JSON 对象时生成
+// 向后兼容的 ToolInput 视图。UseNumber 避免大整数先转成 float64 后丢失精度。
+// 不完整 JSON 仍会原样保留，供 OpenAI arguments 字符串无损转发。
+func (b *ContentBlock) SetToolInputJSON(raw []byte) {
+	if raw == nil {
+		b.ToolInputJSON = nil
+		b.ToolInput = nil
+		return
+	}
+	b.ToolInputJSON = make(json.RawMessage, len(raw))
+	copy(b.ToolInputJSON, raw)
+	b.ToolInput = nil
+	if !json.Valid(raw) {
+		return
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return
+	}
+	if object, ok := value.(map[string]any); ok {
+		b.ToolInput = object
+	}
+}
+
+// ToolInputBytes 返回用于线格式编码的工具参数。存在原始 JSON 时始终优先，
+// 否则兼容只填充旧 ToolInput 字段的调用方；两者都为空时沿用空对象语义。
+func (b ContentBlock) ToolInputBytes() ([]byte, error) {
+	if b.ToolInputJSON != nil {
+		out := make([]byte, len(b.ToolInputJSON))
+		copy(out, b.ToolInputJSON)
+		return out, nil
+	}
+	if b.ToolInput == nil {
+		return []byte("{}"), nil
+	}
+	return json.Marshal(b.ToolInput)
 }
 
 // ImageSource 描述一张图片的来源。

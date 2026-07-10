@@ -19,7 +19,7 @@ func newTestManager(t *testing.T) (*Manager, *miniredis.Miniredis) {
 }
 
 func TestSessionCreateGetDelete(t *testing.T) {
-	m, _ := newTestManager(t)
+	m, mr := newTestManager(t)
 	ctx := context.Background()
 	data := SessionData{AccountID: 1, Username: "alice", Role: "user", ExternalID: "alice"}
 
@@ -29,6 +29,12 @@ func TestSessionCreateGetDelete(t *testing.T) {
 	}
 	if len(token) != 64 { // 32 字节 hex。
 		t.Fatalf("token 应为 64 位 hex, 得到 %d 位", len(token))
+	}
+	if mr.Exists(keyPrefix + token) {
+		t.Fatal("Redis key 不得直接包含可重放的会话 token")
+	}
+	if !mr.Exists(sessionKey(token)) {
+		t.Fatal("会话应按 token 摘要索引")
 	}
 
 	got, err := m.Get(ctx, token)
@@ -83,5 +89,30 @@ func TestSessionExpiry(t *testing.T) {
 	mr.FastForward(2 * time.Second) // 快进过期。
 	if _, err := m.Get(ctx, token); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("过期后应 ErrNotFound, 得到 %v", err)
+	}
+}
+
+func TestSessionLimitIsAtomicAndDeleteFreesSlot(t *testing.T) {
+	_, mr := newTestManager(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	m := NewManagerWithLimit(rdb, 2)
+	ctx := context.Background()
+	data := SessionData{AccountID: 7, Username: "u", Role: "user"}
+	first, err := m.Create(ctx, data, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Create(ctx, data, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Create(ctx, data, time.Hour); !errors.Is(err, ErrTooManyActiveSessions) {
+		t.Fatalf("第三个会话应被拒绝，得到 %v", err)
+	}
+	if err := m.Delete(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Create(ctx, data, time.Hour); err != nil {
+		t.Fatalf("删除后应释放名额，得到 %v", err)
 	}
 }

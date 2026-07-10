@@ -14,7 +14,7 @@ func (a *Adapter) BuildRequest(req *canonical.Request) ([]byte, error) {
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
-		Stop:        req.Stop,
+		Stop:        stopSequences(req.Stop),
 		Stream:      req.Stream,
 	}
 	if req.Stream {
@@ -30,6 +30,13 @@ func (a *Adapter) BuildRequest(req *canonical.Request) ([]byte, error) {
 	// 逐条消息折叠
 	for _, m := range req.Messages {
 		switch m.Role {
+		case canonical.RoleSystem, canonical.RoleDeveloper:
+			msg, err := buildInstructionMessage(m.Role, m.Content)
+			if err != nil {
+				return nil, err
+			}
+			out.Messages = append(out.Messages, msg)
+
 		case canonical.RoleUser:
 			msgs, err := buildUserMessages(m.Content)
 			if err != nil {
@@ -38,7 +45,11 @@ func (a *Adapter) BuildRequest(req *canonical.Request) ([]byte, error) {
 			out.Messages = append(out.Messages, msgs...)
 
 		case canonical.RoleAssistant:
-			out.Messages = append(out.Messages, buildAssistantMessage(m.Content))
+			msg, err := buildAssistantMessage(m.Content)
+			if err != nil {
+				return nil, err
+			}
+			out.Messages = append(out.Messages, msg)
 
 		default:
 			return nil, fmt.Errorf("openai: 无法构造角色 %q", m.Role)
@@ -63,9 +74,18 @@ func (a *Adapter) BuildRequest(req *canonical.Request) ([]byte, error) {
 	return json.Marshal(out)
 }
 
+func buildInstructionMessage(role canonical.Role, blocks []canonical.ContentBlock) (chatMessage, error) {
+	for _, block := range blocks {
+		if block.Type != canonical.BlockText {
+			return chatMessage{}, fmt.Errorf("openai: 角色 %q 只支持 text block", role)
+		}
+	}
+	return chatMessage{Role: string(role), Content: blocksToText(blocks)}, nil
+}
+
 // buildAssistantMessage 把助手 content-block 折叠为一条扁平 assistant 消息：
 // text block 合并进 content；tool_use block 折叠进 tool_calls 数组。
-func buildAssistantMessage(blocks []canonical.ContentBlock) chatMessage {
+func buildAssistantMessage(blocks []canonical.ContentBlock) (chatMessage, error) {
 	msg := chatMessage{Role: "assistant"}
 	var text string
 
@@ -74,9 +94,9 @@ func buildAssistantMessage(blocks []canonical.ContentBlock) chatMessage {
 		case canonical.BlockText:
 			text += b.Text
 		case canonical.BlockToolUse:
-			args, _ := json.Marshal(b.ToolInput)
-			if b.ToolInput == nil {
-				args = []byte("{}")
+			args, err := b.ToolInputBytes()
+			if err != nil {
+				return chatMessage{}, fmt.Errorf("openai: 编码工具参数失败: %w", err)
 			}
 			msg.ToolCalls = append(msg.ToolCalls, toolCall{
 				ID:   b.ToolUseID,
@@ -95,7 +115,7 @@ func buildAssistantMessage(blocks []canonical.ContentBlock) chatMessage {
 	if text != "" {
 		msg.Content = text
 	}
-	return msg
+	return msg, nil
 }
 
 // buildUserMessages 把用户 content-block 折叠为 OpenAI 消息。

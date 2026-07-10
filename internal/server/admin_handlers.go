@@ -21,6 +21,10 @@ func writeAdminError(c *gin.Context, err error) {
 		writeError(c, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, admin.ErrConflict):
 		writeError(c, http.StatusConflict, "conflict", err.Error())
+	case errors.Is(err, admin.ErrInvalidInput):
+		writeError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+	case errors.Is(err, admin.ErrLimitReached):
+		writeError(c, http.StatusConflict, "limit_reached", err.Error())
 	default:
 		writeError(c, http.StatusInternalServerError, "internal_error", "存储操作失败")
 	}
@@ -57,8 +61,14 @@ func (h *adminHandlers) createUser(c *gin.Context) {
 }
 
 func (h *adminHandlers) listUsers(c *gin.Context) {
-	limit := queryInt(c, "limit", 100)
-	offset := queryInt(c, "offset", 0)
+	limit, ok := queryInt(c, "limit", 100, 1, 500)
+	if !ok {
+		return
+	}
+	offset, ok := queryInt(c, "offset", 0, 0, 1_000_000_000)
+	if !ok {
+		return
+	}
 	users, err := h.svc.Store().ListUsers(c.Request.Context(), limit, offset)
 	if err != nil {
 		writeAdminError(c, err)
@@ -77,7 +87,7 @@ func (h *adminHandlers) getUser(c *gin.Context) {
 }
 
 type setEnabledReq struct {
-	Enabled bool `json:"enabled"`
+	Enabled *bool `json:"enabled" binding:"required"`
 }
 
 func (h *adminHandlers) setUserEnabled(c *gin.Context) {
@@ -86,7 +96,7 @@ func (h *adminHandlers) setUserEnabled(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
 		return
 	}
-	u, err := h.svc.Store().SetUserEnabled(c.Request.Context(), c.Param("id"), req.Enabled)
+	u, err := h.svc.Store().SetUserEnabled(c.Request.Context(), c.Param("id"), *req.Enabled)
 	if err != nil {
 		writeAdminError(c, err)
 		return
@@ -124,6 +134,10 @@ func (h *adminHandlers) createKey(c *gin.Context) {
 	var req createKeyReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
+		return
+	}
+	if req.RateLimitPerMin < 0 || req.RateLimitPerMin > admin.MaxRateLimitPerMin {
+		writeError(c, http.StatusBadRequest, "invalid_request_error", "rate_limit_per_min 必须在 0 到 5000 之间")
 		return
 	}
 	enabled := true
@@ -174,7 +188,7 @@ func (h *adminHandlers) setKeyEnabled(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
 		return
 	}
-	k, err := h.svc.Store().SetAPIKeyEnabled(c.Request.Context(), c.Param("keyid"), req.Enabled)
+	k, err := h.svc.Store().SetAPIKeyEnabled(c.Request.Context(), c.Param("keyid"), *req.Enabled)
 	if err != nil {
 		writeAdminError(c, err)
 		return

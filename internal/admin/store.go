@@ -20,6 +20,40 @@ var ErrNotFound = errors.New("admin: 资源不存在")
 // ErrConflict 表示唯一约束冲突（如重复的 external_id / key_id / channel_id）。
 var ErrConflict = errors.New("admin: 资源已存在")
 
+// ErrInvalidInput 表示领域入参超出持久层与限流器共同支持的安全范围。
+var ErrInvalidInput = errors.New("admin: 参数无效")
+
+var ErrLimitReached = errors.New("admin: 数量已达上限")
+
+const (
+	MaxRateLimitPerMin = 5000
+	MaxChannelPriority = 1_000_000
+	MaxChannelWeight   = 1_000_000
+	MinChannelPriority = -MaxChannelPriority
+)
+
+func validateCreateAPIKeyInput(in CreateAPIKeyInput) error {
+	if in.APIKey == "" || in.KeyID == "" || in.UserID == "" ||
+		in.RateLimitPerMin < 0 || in.RateLimitPerMin > MaxRateLimitPerMin {
+		return ErrInvalidInput
+	}
+	return nil
+}
+
+// normalizeChannelInput 在领域边界限制数值到 routing 与 PostgreSQL INT 都能安全
+// 表达的范围，避免 HTTP int 缩窄为 int32 后回绕改变优先级或权重。历史接口中
+// 缺失 weight 代表默认权重 1，因此零值在这里归一，而负值/过大值明确拒绝。
+func normalizeChannelInput(in ChannelInput) (ChannelInput, error) {
+	if in.Priority < MinChannelPriority || in.Priority > MaxChannelPriority ||
+		in.Weight < 0 || in.Weight > MaxChannelWeight {
+		return ChannelInput{}, ErrInvalidInput
+	}
+	if in.Weight == 0 {
+		in.Weight = 1
+	}
+	return in, nil
+}
+
 // User 是管理面的用户视图。
 type User struct {
 	ExternalID string    `json:"external_id"`
@@ -45,7 +79,7 @@ type Channel struct {
 	Name      string            `json:"name"`
 	Format    string            `json:"format"`
 	BaseURL   string            `json:"base_url"`
-	APIKey    string            `json:"api_key,omitempty"`
+	APIKey    string            `json:"-"`
 	Models    map[string]string `json:"models"`
 	Priority  int               `json:"priority"`
 	Weight    int               `json:"weight"`
@@ -79,6 +113,9 @@ type ChannelInput struct {
 	Format    string
 	BaseURL   string
 	APIKey    string
+	// APIKeySet 区分“更新请求未提供密钥（保留旧值）”与“显式设置为空”。
+	// 创建操作始终使用 APIKey，不依赖此标记。
+	APIKeySet bool
 	Models    map[string]string
 	Priority  int
 	Weight    int
@@ -99,6 +136,7 @@ type AdminStore interface {
 
 	// ---- 密钥 ----
 	CreateAPIKey(ctx context.Context, in CreateAPIKeyInput) (APIKey, error)
+	CreateAPIKeyLimited(ctx context.Context, in CreateAPIKeyInput, maxKeys int) (APIKey, error)
 	ListAPIKeysByUser(ctx context.Context, userID string) ([]APIKey, error)
 	SetAPIKeyEnabled(ctx context.Context, keyID string, enabled bool) (APIKey, error)
 	// DeleteAPIKey 物理删除密钥；不存在返回 ErrNotFound。

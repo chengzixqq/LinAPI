@@ -35,8 +35,14 @@ func writeAccountError(c *gin.Context, err error) {
 }
 
 func (h *accountConsoleHandlers) listAccounts(c *gin.Context) {
-	limit := queryInt(c, "limit", 100)
-	offset := queryInt(c, "offset", 0)
+	limit, ok := queryInt(c, "limit", 100, 1, 500)
+	if !ok {
+		return
+	}
+	offset, ok := queryInt(c, "offset", 0, 0, 1_000_000_000)
+	if !ok {
+		return
+	}
 	accs, err := h.accounts.ListAccounts(c.Request.Context(), limit, offset)
 	if err != nil {
 		writeAccountError(c, err)
@@ -64,8 +70,8 @@ func (h *accountConsoleHandlers) createAccount(c *gin.Context) {
 	}
 	hash, err := account.HashPassword(req.Password)
 	if err != nil {
-		if errors.Is(err, account.ErrPasswordTooShort) {
-			writeError(c, http.StatusBadRequest, "invalid_request_error", "密码长度不足（至少 8 位）")
+		if errors.Is(err, account.ErrPasswordTooShort) || errors.Is(err, account.ErrPasswordTooLong) {
+			writeError(c, http.StatusBadRequest, "invalid_request_error", "密码须至少 8 个字符且不超过 72 字节")
 			return
 		}
 		writeError(c, http.StatusInternalServerError, "internal_error", "处理密码失败")
@@ -99,7 +105,7 @@ func (h *accountConsoleHandlers) setAccountEnabled(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "invalid_request_error", "请求体无效: "+err.Error())
 		return
 	}
-	acc, err := h.accounts.SetEnabled(c.Request.Context(), id, req.Enabled)
+	acc, err := h.accounts.SetEnabled(c.Request.Context(), id, *req.Enabled)
 	if err != nil {
 		writeAccountError(c, err)
 		return
@@ -124,8 +130,8 @@ func (h *accountConsoleHandlers) resetPassword(c *gin.Context) {
 	}
 	hash, err := account.HashPassword(req.Password)
 	if err != nil {
-		if errors.Is(err, account.ErrPasswordTooShort) {
-			writeError(c, http.StatusBadRequest, "invalid_request_error", "密码长度不足（至少 8 位）")
+		if errors.Is(err, account.ErrPasswordTooShort) || errors.Is(err, account.ErrPasswordTooLong) {
+			writeError(c, http.StatusBadRequest, "invalid_request_error", "密码须至少 8 个字符且不超过 72 字节")
 			return
 		}
 		writeError(c, http.StatusInternalServerError, "internal_error", "处理密码失败")

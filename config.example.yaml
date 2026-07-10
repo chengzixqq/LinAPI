@@ -5,27 +5,91 @@
 server:
   port: 8080
   mode: release        # debug | release
+  read_timeout_seconds: 30
+  idle_timeout_seconds: 120
+  max_request_body_bytes: 33554432  # 32 MiB；含 base64 图片的完整 JSON 请求体
+  max_header_bytes: 65536
+  metrics_token: ""       # release 必填；建议用 LINAPI_SERVER_METRICS_TOKEN 注入
+  metrics_max_requests_in_flight: 2 # 超出并发抓取预算时直接返回 503
+  metrics_timeout_seconds: 10       # 单次抓取处理预算；生产环境应保持正数
 
 database:
   enabled: false            # true 启用 PostgreSQL（身份/额度/用量/渠道落库）；false 走内存实现，本地开发免装 DB
   dsn: "postgres://postgres:postgres@localhost:5432/linapi?sslmode=disable"
   max_open_conns: 50
-  max_idle_conns: 10
+  min_idle_conns: 10       # pgxpool 保持的最小空闲连接数（不是最大空闲上限）
   conn_max_lifetime: 3600   # 秒
   auto_migrate: true        # true 时启动期幂等建表（全部 IF NOT EXISTS）
+  channel_key_encryption:
+    # 生产必须由外部密钥系统/环境变量注入，勿把真实主密钥写入配置仓库。
+    # LINAPI_DATABASE_CHANNEL_KEY_ENCRYPTION_KEY_ID=primary-2026-01
+    key_id: ""
+    # LINAPI_DATABASE_CHANNEL_KEY_ENCRYPTION_KEY=$(openssl rand -base64 32)
+    key: ""
+    # 仅旧库维护窗口启用一次；事务迁移成功后立即恢复 false。
+    migrate_plaintext: false
 
 redis:
   addr: "localhost:6379"
+  username: ""          # Redis ACL 用户名
   password: ""
   db: 0
+  allow_insecure_remote: false  # release 下远程 Redis 无 TLS 默认拒绝启动
+  tls:
+    enabled: false
+    server_name: ""
+    ca_file: ""
+    cert_file: ""       # 可选 mTLS 客户端证书；须与 key_file 同时配置
+    key_file: ""
 
 log:
   level: info          # debug | info | warn | error
   format: json         # json | text
 
+# 生产默认只允许公共 HTTPS 上游。确需访问内网代理时，按精确 host:port 和最小 CIDR
+# 放行；allow_http 也只作用于该 authority。不要把 0.0.0.0/0 当作例外。
+upstream:
+  target_rules: []
+  # - authority: "llm-proxy.internal:8443"
+  #   allow_http: false
+  #   allowed_cidrs: ["10.20.0.0/24"]
+
+# 计费单价与预授权边界。金额单位均为“最小计费单位”。生产必须按对外模型
+# 配置可证明的最大计费输入/输出；请求会先冻结最坏成本，完成后按真实 usage 退差。
+billing:
+  default_reserve: 10000
+  default_input_per_1m: 2000000
+  default_output_per_1m: 6000000
+  default_cache_creation_input_per_1m: 2500000
+  default_cache_read_input_per_1m: 200000
+  default_max_billable_input_tokens: 128000
+  default_max_output_tokens: 4096
+  # OpenAI 兼容上游实际识别的输出上限字段。release 模式要求每个已启用 OpenAI
+  # 渠道的真实上游模型都有映射；优先匹配 channel_id/upstream_model，再匹配 upstream_model。
+  openai_output_limit_fields:
+    "openai-main/gpt-4o-2024-08-06": "max_tokens"
+    "openai-main/gpt-4o-mini": "max_tokens"
+  models:
+    - model: "gpt-4o"
+      input_per_1m: 2500000
+      output_per_1m: 10000000
+      cache_creation_input_per_1m: 3125000
+      cache_read_input_per_1m: 250000
+      max_billable_input_tokens: 128000
+      max_output_tokens: 4096
+    - model: "gpt-4o-mini"
+      input_per_1m: 150000
+      output_per_1m: 600000
+      cache_creation_input_per_1m: 187500
+      cache_read_input_per_1m: 15000
+      max_billable_input_tokens: 128000
+      max_output_tokens: 16384
+
 # 鉴权与额度（过渡期配置，第 7 步接入数据库后退役）。
 # keys 列表驱动内存 Store：每个 API Key 映射到用户、限流阈值、可用模型与初始额度。
 auth:
+  unauthenticated_rate_limit_per_min: 120  # API Key 查库前按 socket 来源 IP 限速
+  account_rate_limit_per_min: 10000        # 同一账户全部 Key 共享的总预算
   keys:
     - api_key: "sk-local-dev"        # 客户端用 Authorization: Bearer 或 x-api-key 传入
       key_id: "key-dev"              # 稳定标识，用作限流维度与计费归因
@@ -46,6 +110,9 @@ admin:
     username: ""                   # 为空则不播种
     password: ""                   # 为空则不播种并告警（绝不建空密码账户）
   channel_reload_interval: 60      # 渠道定时热重载间隔（秒），<=0 关闭；仅 database.enabled=true 时生效
+  auth_rate_limit_per_min: 30      # /auth 登录/注册每来源 IP 每分钟预算
+  auth_identifier_rate_limit_per_min: 20 # 每登录名、每认证端点预算；与 IP 预算叠加
+  max_active_sessions_per_account: 10
 
 # 上游渠道（过渡期配置来源）。database.enabled=true 时渠道改由 channels 表管理，
 # 本段仅在内存模式（database.enabled=false）下驱动路由引擎。

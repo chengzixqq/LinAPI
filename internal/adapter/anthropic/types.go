@@ -4,6 +4,12 @@
 // 因此转换比 OpenAI 更直接：多数 block 一一对应，无需展开/折叠。
 package anthropic
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
 // ---- Anthropic Messages 线格式结构 ----
 
 // messagesRequest 对应 POST /v1/messages 的请求体。
@@ -23,8 +29,35 @@ type messagesRequest struct {
 
 // message 是一条 Claude 消息，content 为 block 数组。
 type message struct {
-	Role    string  `json:"role"` // user | assistant
-	Content []block `json:"content"`
+	Role    string         `json:"role"` // user | assistant
+	Content messageContent `json:"content"`
+}
+
+// messageContent 兼容 Anthropic message.content 的字符串与 block 数组联合格式。
+// 入向统一归一成 block 切片，出向沿用数组表示以保留现有适配器行为。
+type messageContent []block
+
+func (c *messageContent) UnmarshalJSON(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	switch {
+	case bytes.Equal(trimmed, []byte("null")):
+		*c = nil
+		return nil
+	case len(trimmed) > 0 && trimmed[0] == '"':
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil {
+			return fmt.Errorf("message.content 字符串无效: %w", err)
+		}
+		*c = messageContent{{Type: "text", Text: text}}
+		return nil
+	default:
+		var blocks []block
+		if err := json.Unmarshal(trimmed, &blocks); err != nil {
+			return fmt.Errorf("message.content 必须是字符串或 block 数组: %w", err)
+		}
+		*c = messageContent(blocks)
+		return nil
+	}
 }
 
 // block 是一个 content block，涵盖各类型。用一个结构承载所有字段，
@@ -43,9 +76,9 @@ type block struct {
 	Source *imageSource `json:"source,omitempty"`
 
 	// tool_use
-	ID    string         `json:"id,omitempty"`
-	Name  string         `json:"name,omitempty"`
-	Input map[string]any `json:"input,omitempty"`
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
 
 	// tool_result
 	ToolUseID string `json:"tool_use_id,omitempty"`
@@ -96,8 +129,9 @@ type messagesResponse struct {
 }
 
 type usage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	// 指针用于区分字段缺失与上游明确返回 0。
+	InputTokens              *int `json:"input_tokens,omitempty"`
+	OutputTokens             *int `json:"output_tokens,omitempty"`
+	CacheCreationInputTokens int  `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int  `json:"cache_read_input_tokens,omitempty"`
 }

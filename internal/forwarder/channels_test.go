@@ -1,9 +1,11 @@
 package forwarder
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"linapi/internal/config"
 	"linapi/internal/db"
@@ -129,5 +131,49 @@ func TestSSEReaderNoTrailingBlank(t *testing.T) {
 	}
 	if _, err := r.Next(); err != io.EOF {
 		t.Errorf("应返回 EOF，得 %v", err)
+	}
+}
+
+func TestSSEReaderAcceptsBOMAndBareCR(t *testing.T) {
+	r := newSSEReader(strings.NewReader("\uFEFFevent: chunk\rdata: {\"x\":1}\r\rdata: [DONE]\r\r"))
+	want := []string{"event: chunk\ndata: {\"x\":1}", "data: [DONE]"}
+	for i, expected := range want {
+		rec, err := r.Next()
+		if err != nil {
+			t.Fatalf("记录 %d 读取失败: %v", i, err)
+		}
+		if string(rec) != expected {
+			t.Fatalf("记录 %d = %q, want %q", i, rec, expected)
+		}
+	}
+	if _, err := r.Next(); err != io.EOF {
+		t.Fatalf("末尾应返回 EOF，得 %v", err)
+	}
+}
+
+func TestReadAtMostRejectsOversizedResponse(t *testing.T) {
+	if _, err := readAtMost(strings.NewReader("1234"), 3); !errors.Is(err, errUpstreamResponseTooLarge) {
+		t.Fatalf("超大响应应被拒绝，得到 %v", err)
+	}
+}
+
+func TestIdleReadCloserTimesOutStalledStream(t *testing.T) {
+	reader, writer := io.Pipe()
+	t.Cleanup(func() { _ = writer.Close() })
+	r := newIdleReadCloser(reader, 20*time.Millisecond)
+	start := time.Now()
+	_, err := r.Read(make([]byte, 1))
+	if !errors.Is(err, errUpstreamStreamIdle) {
+		t.Fatalf("停滞流应返回空闲超时，得到 %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("空闲超时未及时解除阻塞: %s", elapsed)
+	}
+}
+
+func TestSSEReaderRejectsOversizedRecord(t *testing.T) {
+	r := newSSEReader(strings.NewReader("data: " + strings.Repeat("x", maxSSERecordBytes) + "\n\n"))
+	if _, err := r.Next(); !errors.Is(err, errSSERecordTooLarge) {
+		t.Fatalf("超大 SSE 记录应被拒绝，得到 %v", err)
 	}
 }

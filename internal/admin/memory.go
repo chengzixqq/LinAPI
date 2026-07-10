@@ -92,9 +92,31 @@ func (m *MemoryStore) AddBalance(_ context.Context, externalID string, delta int
 // ---- 密钥 ----
 
 func (m *MemoryStore) CreateAPIKey(_ context.Context, in CreateAPIKeyInput) (APIKey, error) {
+	if err := validateCreateAPIKeyInput(in); err != nil {
+		return APIKey{}, err
+	}
 	v, err := m.base.AdminCreateKey(in.APIKey, in.KeyID, in.UserID, in.RateLimitPerMin, in.AllowedModels, in.Enabled)
 	if err != nil {
 		return APIKey{}, mapUserErr(err)
+	}
+	return keyFromView(v), nil
+}
+
+func (m *MemoryStore) CreateAPIKeyLimited(_ context.Context, in CreateAPIKeyInput, maxKeys int) (APIKey, error) {
+	if err := validateCreateAPIKeyInput(in); err != nil {
+		return APIKey{}, err
+	}
+	if maxKeys <= 0 {
+		return APIKey{}, ErrInvalidInput
+	}
+	v, created, err := m.base.AdminCreateKeyLimited(
+		in.APIKey, in.KeyID, in.UserID, in.RateLimitPerMin, in.AllowedModels, in.Enabled, maxKeys,
+	)
+	if err != nil {
+		return APIKey{}, mapUserErr(err)
+	}
+	if !created {
+		return APIKey{}, ErrLimitReached
 	}
 	return keyFromView(v), nil
 }
@@ -123,6 +145,11 @@ func (m *MemoryStore) DeleteAPIKey(_ context.Context, keyID string) error {
 // ---- 渠道 ----
 
 func (m *MemoryStore) CreateChannel(_ context.Context, in ChannelInput) (Channel, error) {
+	var err error
+	in, err = normalizeChannelInput(in)
+	if err != nil {
+		return Channel{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.channels[in.ChannelID]; ok {
@@ -161,11 +188,19 @@ func (m *MemoryStore) GetChannel(_ context.Context, channelID string) (Channel, 
 }
 
 func (m *MemoryStore) UpdateChannel(_ context.Context, in ChannelInput) (Channel, error) {
+	var err error
+	in, err = normalizeChannelInput(in)
+	if err != nil {
+		return Channel{}, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	old, ok := m.channels[in.ChannelID]
 	if !ok {
 		return Channel{}, ErrNotFound
+	}
+	if !in.APIKeySet {
+		in.APIKey = old.APIKey
 	}
 	c := channelFromInput(in, old.CreatedAt, time.Now())
 	m.channels[in.ChannelID] = &c
@@ -202,7 +237,7 @@ func userFromView(v store.MemUserView) User {
 		Balance:    v.Balance,
 		Enabled:    v.Enabled,
 		CreatedAt:  v.CreatedAt,
-		UpdatedAt:  v.CreatedAt,
+		UpdatedAt:  v.UpdatedAt,
 	}
 }
 

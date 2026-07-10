@@ -1,5 +1,7 @@
 # LinAPI 管理控制台 — 后端认证层实现计划（Plan 1/2）
 
+> **状态（2026-07-11）**：Plan 1 后端已实现；本文件保留为 2026-07-10 的实施计划，未逐项回填复选框或示例代码。当前实现与剩余审查项以 [`../../progress.md`](../../progress.md) 和 [`../../reviews/2026-07-10-comprehensive-readonly-audit.md`](../../reviews/2026-07-10-comprehensive-readonly-audit.md) 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 为 LinAPI 网关补齐统一账户认证体系（账户/密码/角色/会话），并把 `/admin/*` 从裸 token 鉴权切换为「会话 + 角色」，新增用户自助 `/me/*` 与认证 `/auth/*` 端点。

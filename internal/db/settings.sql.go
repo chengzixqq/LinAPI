@@ -30,3 +30,38 @@ func (q *Queries) UpsertSetting(ctx context.Context, arg UpsertSettingParams) er
 	_, err := q.db.Exec(ctx, upsertSetting, arg.Key, arg.Value)
 	return err
 }
+
+const getSettingsSnapshot = `-- name: GetSettingsSnapshot :one
+SELECT
+    COALESCE((SELECT value FROM settings WHERE key = 'registration_enabled'), '') AS registration_enabled,
+    COALESCE((SELECT value FROM settings WHERE key = 'new_user_initial_balance'), '') AS new_user_initial_balance
+`
+
+type GetSettingsSnapshotRow struct {
+	RegistrationEnabled   string `json:"registration_enabled"`
+	NewUserInitialBalance string `json:"new_user_initial_balance"`
+}
+
+func (q *Queries) GetSettingsSnapshot(ctx context.Context) (GetSettingsSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, getSettingsSnapshot)
+	var i GetSettingsSnapshotRow
+	err := row.Scan(&i.RegistrationEnabled, &i.NewUserInitialBalance)
+	return i, err
+}
+
+const upsertSettingsSnapshot = `-- name: UpsertSettingsSnapshot :exec
+INSERT INTO settings (key, value, updated_at) VALUES
+    ('registration_enabled', $1, now()),
+    ('new_user_initial_balance', $2, now())
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+`
+
+type UpsertSettingsSnapshotParams struct {
+	RegistrationEnabled   string `json:"registration_enabled"`
+	NewUserInitialBalance string `json:"new_user_initial_balance"`
+}
+
+func (q *Queries) UpsertSettingsSnapshot(ctx context.Context, arg UpsertSettingsSnapshotParams) error {
+	_, err := q.db.Exec(ctx, upsertSettingsSnapshot, arg.RegistrationEnabled, arg.NewUserInitialBalance)
+	return err
+}

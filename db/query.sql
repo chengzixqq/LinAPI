@@ -13,7 +13,7 @@ FROM users
 WHERE external_id = $1;
 
 -- name: GetBalance :one
--- 只取余额，供额度中间件读冷源 seed。禁用用户视作 0 余额（闸门自然拦截）。
+-- 只取 PostgreSQL 权威可用余额。禁用用户视作 0 余额（闸门自然拦截）。
 SELECT balance
 FROM users
 WHERE external_id = $1 AND enabled = TRUE;
@@ -22,6 +22,7 @@ WHERE external_id = $1 AND enabled = TRUE;
 -- 原子增减余额并返回新值，供充值/对账。delta 为负表示扣费。
 UPDATE users
 SET balance = balance + $2,
+	 balance_version = balance_version + 1,
     updated_at = now()
 WHERE external_id = $1
 RETURNING balance;
@@ -68,6 +69,19 @@ INSERT INTO api_keys (
 ) VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING id, key_hash, key_id, user_external_id, rate_limit_per_min, allowed_models, enabled, created_at;
 
+-- name: CreateAPIKeyLimited :one
+-- 同一用户用事务级 advisory lock 串行化“计数 + 插入”，防止并发越过数量上限。
+WITH lock_row AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock(hashtextextended($3, 0))
+)
+INSERT INTO api_keys (
+    key_hash, key_id, user_external_id, rate_limit_per_min, allowed_models, enabled
+)
+SELECT $1, $2, $3, $4, $5, $6
+FROM lock_row
+WHERE (SELECT count(*) FROM api_keys WHERE user_external_id = $3) < $7
+RETURNING id, key_hash, key_id, user_external_id, rate_limit_per_min, allowed_models, enabled, created_at;
+
 -- name: ListAPIKeysByUser :many
 -- 管理面：列出某用户的全部密钥（不含 key_hash，摘要不外泄）。
 SELECT id, key_id, user_external_id, rate_limit_per_min, allowed_models, enabled, created_at
@@ -97,6 +111,21 @@ FROM channels
 WHERE enabled = TRUE
 ORDER BY priority DESC, channel_id;
 
+-- name: ListChannelKeyMaterialsForUpdate :many
+-- 启动迁移在同一事务内锁定全部渠道密钥，避免迁移期间并发写入明文。
+SELECT channel_id, api_key
+FROM channels
+ORDER BY channel_id
+FOR UPDATE;
+
+-- name: UpdateChannelKeyMaterial :execrows
+-- 仅当旧值仍与锁定时一致才替换，防止意外覆盖并发变更。
+UPDATE channels
+SET api_key = sqlc.arg(api_key),
+    updated_at = now()
+WHERE channel_id = sqlc.arg(channel_id)
+  AND api_key = sqlc.arg(old_api_key);
+
 -- name: CreateChannel :one
 INSERT INTO channels (
     channel_id, name, format, base_url, api_key, models, priority, weight, enabled
@@ -117,16 +146,19 @@ WHERE channel_id = $1;
 -- name: UpdateChannel :one
 -- 管理面：全量更新渠道可变字段。
 UPDATE channels
-SET name = $2,
-    format = $3,
-    base_url = $4,
-    api_key = $5,
-    models = $6,
-    priority = $7,
-    weight = $8,
-    enabled = $9,
+SET name = sqlc.arg(name),
+    format = sqlc.arg(format),
+    base_url = sqlc.arg(base_url),
+    api_key = CASE
+        WHEN sqlc.arg(api_key_set)::boolean THEN sqlc.arg(api_key)::text
+        ELSE api_key
+    END,
+    models = sqlc.arg(models),
+    priority = sqlc.arg(priority),
+    weight = sqlc.arg(weight),
+    enabled = sqlc.arg(enabled),
     updated_at = now()
-WHERE channel_id = $1
+WHERE channel_id = sqlc.arg(channel_id)
 RETURNING id, channel_id, name, format, base_url, api_key, models, priority, weight, enabled, created_at, updated_at;
 
 -- name: SetChannelEnabled :one
@@ -194,17 +226,147 @@ SELECT key, value, updated_at FROM settings WHERE key = $1;
 INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now())
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
 
--- ============================ usage_logs ============================
+-- name: GetSettingsSnapshot :one
+-- 单条语句读取完整设置快照，避免两次 READ COMMITTED 查询拼出不存在的组合。
+SELECT
+    COALESCE((SELECT value FROM settings WHERE key = 'registration_enabled'), '') AS registration_enabled,
+    COALESCE((SELECT value FROM settings WHERE key = 'new_user_initial_balance'), '') AS new_user_initial_balance;
 
--- name: InsertUsageLog :exec
--- 单条用量日志落库。ON CONFLICT (request_id) 保证按请求幂等（重放不重复记账）。
-INSERT INTO usage_logs (
-    request_id, user_id, key_id, model, channel, input_tokens, output_tokens, cost, created_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-ON CONFLICT (request_id) DO NOTHING;
+-- name: UpsertSettingsSnapshot :exec
+-- 单条语句原子写入完整设置快照。
+INSERT INTO settings (key, value, updated_at) VALUES
+    ('registration_enabled', $1, now()),
+    ('new_user_initial_balance', $2, now())
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now();
+
+-- ============================ usage_logs ============================
 
 -- name: SumCostByUser :one
 -- 对账用：统计某用户在时间窗内的总扣费。
 SELECT COALESCE(SUM(cost), 0)::BIGINT AS total_cost
 FROM usage_logs
 WHERE user_id = $1 AND created_at >= $2 AND created_at < $3;
+
+-- ============================ billing ledger ============================
+
+-- name: InsertBillingReservation :one
+-- 先插 reservation，再在同一事务内条件扣余额；冲突时由调用方读取旧记录做幂等比较。
+INSERT INTO billing_reservations (
+    reservation_id, trace_id, user_id, key_id, model, amount,
+    max_input_tokens, max_output_tokens, status, created_at, updated_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'reserved', $9, $9)
+ON CONFLICT (reservation_id) DO NOTHING
+RETURNING reservation_id, trace_id, user_id, key_id, model, amount,
+          max_input_tokens, max_output_tokens, status, channel,
+          input_tokens, output_tokens, cache_creation_input_tokens,
+          cache_read_input_tokens, reported_total_tokens, cost,
+          usage_complete, estimated, created_at, consumed_at,
+          settled_at, refunded_at, updated_at;
+
+-- name: GetBillingReservation :one
+SELECT reservation_id, trace_id, user_id, key_id, model, amount,
+       max_input_tokens, max_output_tokens, status, channel,
+       input_tokens, output_tokens, cache_creation_input_tokens,
+       cache_read_input_tokens, reported_total_tokens, cost,
+       usage_complete, estimated, created_at, consumed_at,
+       settled_at, refunded_at, updated_at
+FROM billing_reservations
+WHERE reservation_id = $1;
+
+-- name: GetBillingReservationForUpdate :one
+SELECT reservation_id, trace_id, user_id, key_id, model, amount,
+       max_input_tokens, max_output_tokens, status, channel,
+       input_tokens, output_tokens, cache_creation_input_tokens,
+       cache_read_input_tokens, reported_total_tokens, cost,
+       usage_complete, estimated, created_at, consumed_at,
+       settled_at, refunded_at, updated_at
+FROM billing_reservations
+WHERE reservation_id = $1
+FOR UPDATE;
+
+-- name: DebitBalanceForReservation :one
+-- 条件扣款同时承担并发额度闸门：同一用户的并发 reservation 不得超卖。
+UPDATE users
+SET balance = balance - $2,
+    balance_version = balance_version + 1,
+    updated_at = now()
+WHERE external_id = $1 AND enabled = TRUE AND $2 > 0 AND balance >= $2
+RETURNING balance, balance_version;
+
+-- name: AdjustBalanceForBilling :one
+-- Settle/Refund 已由 reservation 行锁保证一次性，这里只应用对应的余额差额。
+UPDATE users
+SET balance = balance + $2,
+    balance_version = balance_version + 1,
+    updated_at = now()
+WHERE external_id = $1
+RETURNING balance, balance_version;
+
+-- name: RecordBillingConsumption :execrows
+UPDATE billing_reservations
+SET status = 'consumed_unsettled',
+    channel = $2,
+    input_tokens = $3,
+    output_tokens = $4,
+    cache_creation_input_tokens = $5,
+    cache_read_input_tokens = $6,
+    reported_total_tokens = $7,
+    cost = $8,
+    usage_complete = $9,
+    estimated = $10,
+    consumed_at = $11,
+    updated_at = $11
+WHERE reservation_id = $1 AND status = 'in_flight';
+
+-- name: MarkBillingReservationInFlight :execrows
+UPDATE billing_reservations
+SET status = 'in_flight', channel = $2, updated_at = $3
+WHERE reservation_id = $1 AND status = 'reserved';
+
+-- name: ReleaseBillingAttempt :execrows
+UPDATE billing_reservations
+SET status = 'reserved', updated_at = $2
+WHERE reservation_id = $1 AND status = 'in_flight';
+
+-- name: MarkBillingReservationSettled :execrows
+UPDATE billing_reservations
+SET status = 'settled', settled_at = $2, updated_at = $2
+WHERE reservation_id = $1 AND status = 'consumed_unsettled';
+
+-- name: MarkBillingReservationRefunded :execrows
+UPDATE billing_reservations
+SET status = 'refunded', refunded_at = $2, updated_at = $2
+WHERE reservation_id = $1 AND status = 'reserved';
+
+-- name: InsertBillingLedgerEntry :exec
+INSERT INTO billing_ledger (
+    operation_id, reservation_id, user_id, kind, amount,
+    balance_after, balance_version, created_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+
+-- name: InsertFinalizedUsageLog :exec
+-- 权威 usage 与余额结算同事务写入，不再依赖异步 Recorder 才能对账。
+INSERT INTO usage_logs (
+    request_id, user_id, key_id, model, channel,
+    input_tokens, output_tokens, cache_creation_input_tokens,
+    cache_read_input_tokens, reported_total_tokens, cost,
+    usage_complete, estimated, created_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14);
+
+-- name: ListConsumedUnsettledReservations :many
+SELECT reservation_id
+FROM billing_reservations
+WHERE status = 'consumed_unsettled'
+ORDER BY consumed_at, reservation_id;
+
+-- name: ListStaleReservedReservations :many
+SELECT reservation_id
+FROM billing_reservations
+WHERE status = 'reserved' AND updated_at < $1
+ORDER BY updated_at, reservation_id;
+
+-- name: ListStaleInFlightReservations :many
+SELECT reservation_id
+FROM billing_reservations
+WHERE status = 'in_flight' AND updated_at < $1
+ORDER BY updated_at, reservation_id;
