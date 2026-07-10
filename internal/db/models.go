@@ -6,15 +6,15 @@ import (
 
 // User 对应 users 表。balance 按 sqlc.yaml 的 override 映射为 int64（最小计费单位）。
 type User struct {
-	ID         int64              `json:"id"`
-	ExternalID string             `json:"external_id"`
-	Balance    int64              `json:"balance"`
+	ID         int64  `json:"id"`
+	ExternalID string `json:"external_id"`
+	Balance    int64  `json:"balance"`
 	// RateMultiplier 是预留的单用户定价倍率（百分比，100=1.00x）；本期存而不用，
 	// 现有查询不 select 该列，故此字段暂不参与任何 Scan。
 	RateMultiplier int32              `json:"rate_multiplier"`
-	Enabled    bool               `json:"enabled"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+	Enabled        bool               `json:"enabled"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
 // ApiKey 对应 api_keys 表。key_hash 存 SHA-256 摘要，绝不落明文。
