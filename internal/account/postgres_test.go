@@ -1,0 +1,70 @@
+package account
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"linapi/internal/db"
+)
+
+// fakeQuerier 是 db.Querier 的测试替身，只实现本测试触达的方法。
+type fakeQuerier struct {
+	db.Querier
+	getByUsernameFn func(ctx context.Context, u string) (db.Account, error)
+	getSettingFn    func(ctx context.Context, k string) (db.Setting, error)
+}
+
+func (f *fakeQuerier) GetAccountByUsername(ctx context.Context, u string) (db.Account, error) {
+	return f.getByUsernameFn(ctx, u)
+}
+func (f *fakeQuerier) GetSetting(ctx context.Context, k string) (db.Setting, error) {
+	return f.getSettingFn(ctx, k)
+}
+
+func TestPGGetCredentials(t *testing.T) {
+	ctx := context.Background()
+	q := &fakeQuerier{
+		getByUsernameFn: func(_ context.Context, u string) (db.Account, error) {
+			if u == "ghost" {
+				return db.Account{}, pgx.ErrNoRows
+			}
+			return db.Account{
+				ID: 1, Username: u, PasswordHash: "bh", Role: RoleUser,
+				ExternalID: pgtype.Text{String: u, Valid: true}, Enabled: true,
+			}, nil
+		},
+	}
+	s := &PGStore{q: q}
+
+	cred, err := s.GetCredentials(ctx, "alice")
+	if err != nil {
+		t.Fatalf("GetCredentials 失败: %v", err)
+	}
+	if cred.PasswordHash != "bh" || cred.ExternalID != "alice" {
+		t.Fatalf("凭证映射错误: %+v", cred)
+	}
+	if _, err := s.GetCredentials(ctx, "ghost"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("不存在应 ErrNotFound, 得到 %v", err)
+	}
+}
+
+func TestPGGetSettingsDefaults(t *testing.T) {
+	ctx := context.Background()
+	q := &fakeQuerier{
+		getSettingFn: func(_ context.Context, _ string) (db.Setting, error) {
+			return db.Setting{}, pgx.ErrNoRows // 键缺失 -> 回退默认。
+		},
+	}
+	s := &PGStore{q: q}
+	got, err := s.Get(ctx)
+	if err != nil {
+		t.Fatalf("Get 设置失败: %v", err)
+	}
+	if got.RegistrationEnabled != DefaultRegistrationEnabled || got.NewUserInitialBalance != DefaultNewUserInitialBalance {
+		t.Fatalf("缺失键应回退默认, 得到 %+v", got)
+	}
+}

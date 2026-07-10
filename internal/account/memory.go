@@ -187,3 +187,9 @@ func pageAccounts(a []Account, limit, offset int) []Account {
 	}
 	return a
 }
+
+// 编译期断言：MemoryStore 同时实现两个接口。
+var (
+	_ AccountStore  = (*MemoryStore)(nil)
+	_ SettingsStore = (*MemoryStore)(nil)
+)
