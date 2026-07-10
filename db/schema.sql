@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS users (
     external_id TEXT        NOT NULL UNIQUE,
     -- balance 是权威余额（最小计费单位）。Redis 只是热副本，这里才是冷源真相。
     balance     BIGINT      NOT NULL DEFAULT 0,
+    -- rate_multiplier 预留：单用户定价倍率覆盖，百分比整数（100=1.00x），本期存而不用。
+    rate_multiplier INT     NOT NULL DEFAULT 100,
     enabled     BOOLEAN     NOT NULL DEFAULT TRUE,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -78,3 +80,30 @@ CREATE TABLE IF NOT EXISTS usage_logs (
 
 CREATE INDEX IF NOT EXISTS idx_usage_logs_user ON usage_logs (user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_usage_logs_created ON usage_logs (created_at);
+
+-- 登录账户：控制台的鉴权主体（与计费实体 users 职责分离）。
+CREATE TABLE IF NOT EXISTS accounts (
+    id            BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    -- username 登录名，全局唯一。
+    username      TEXT        NOT NULL UNIQUE,
+    -- password_hash 存 bcrypt 哈希，绝不落明文，绝不用快哈希（MD5/SHA）。
+    password_hash TEXT        NOT NULL,
+    -- role 仅 'admin' | 'user'。
+    role          TEXT        NOT NULL,
+    -- external_id 软关联 users.external_id：user 角色必填（额度容器），admin 可空。
+    external_id   TEXT,
+    -- group_name 预留：定价分组名，本期存而不用。
+    group_name    TEXT        NOT NULL DEFAULT 'default',
+    enabled       BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_role ON accounts (role);
+
+-- 系统设置：运行时可变的 KV 配置，控制台可改、即时生效。
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT        PRIMARY KEY,
+    value      TEXT        NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
