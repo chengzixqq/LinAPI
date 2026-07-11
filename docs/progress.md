@@ -184,6 +184,7 @@
 - **契约对齐**：注册页明示"初始额度 0"（AUD-P0-07），设置页移除 `new_user_initial_balance` 输入（后端恒 0 且拒绝非 0 写入）；自助建 key 表单限速 1..5000、默认 60（对齐 me_handlers 硬约束）。
 - **注册入口精确化（2026-07-11 补齐）**：后端新增公开只读端点 `GET /auth/registration-status`（匿名可达、同挂 IP 限流、读设置失败 fail-closed 返回 false），登录页据此决定是否渲染注册入口（查询失败保守隐藏），取代原"始终显示 + 点击后 403 兜底"的从简做法。TDD 覆盖 `TestRegistrationStatusReflectsSetting`。
 - **构建门禁全绿**：`npm run build`（`tsc -b && vite build`，7002 模块）、`go build ./...`、`go test ./internal/server/...` 全通过。Mantine 迁移要点：`DataTable` 基于 `Table` 基元 + 客户端分页自实现并保留 `ColumnDef`（title/dataIndex/render）抽象让页面零改动；`Popconfirm`→`modals.openConfirmModal`、`SideSheet`→`Drawer`、`Form`→`@mantine/form`；渠道表单 `useForm<ChannelFormValues>` 显式标注保住 `format` 字面量联合。
+- **embed 占位文件自愈（2026-07-11）**：`vite.config.ts` 的 `emptyOutDir:true` 每次构建会清空 `web_dist` 连带删掉被 git 追踪的 `.gitkeep`，而 `//go:embed all:web_dist` 要求该目录在编译期存在——全新 checkout 若无产物又丢占位文件会导致 `go build` 失败。加 `keepGitkeep` 插件在 `closeBundle` 收尾重建 `.gitkeep`，让产物目录永远可编译。
 - **API 端到端已验（2026-07-11，运行中网关 `config.dev.yaml`）**：预编译 `bin/linapi.exe` + `cmd/devredis` 起本地栈，对活网关跑通 login→me→CSRF 拦截/放行→登出全链路，并逐项验证本轮安全批次：CSRF 写请求缺 `X-CSRF-Token` 403 / 带正确 token 201；P0-07 开注册后自助注册新用户余额恒 0；P1-28 建 key 限速 0/6000 越界 400、60 合法 201 且明文只回显一次；P1-17 admin 改密后旧会话立即 401、新密码可登录。构建门禁全绿（typecheck / go build / vite build 7002 模块 / go vet）。
 - **待验收边界**：真机浏览器可视化 UI 走查（点击式）本轮未做——chrome-devtools MCP 写死找 Chrome，本机仅 Edge 150，改由用户在 Edge 手动按自测清单点检；功能契约已由上述 API 端到端覆盖。打包体积单 chunk >500KB（未做 code-split，非阻塞）。
 
