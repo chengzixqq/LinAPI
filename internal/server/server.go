@@ -189,6 +189,8 @@ func (s *Server) registerAuthRoutes() {
 	g.POST("/login", authLimiter.Middleware(), h.login)
 	g.POST("/logout", sessAuth, h.logout)
 	g.GET("/me", sessAuth, h.me)
+	// 公开只读：登录页据此决定是否显示注册入口（匿名可达）。同挂 IP 限流兜底滥用。
+	g.GET("/registration-status", authLimiter.Middleware(), h.registrationStatus)
 }
 
 // registerMeRoutes 挂载 /me 分组（用户自助）。需登录（任意角色）。

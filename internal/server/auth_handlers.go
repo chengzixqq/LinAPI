@@ -251,3 +251,15 @@ func (h *authHandlers) me(c *gin.Context) {
 		"csrf_token": s.CSRFToken, // 前端刷新后恢复 CSRF token（审查 AUD-P1-26）。
 	})
 }
+
+// registrationStatus 是公开只读端点：匿名可达（未登录也能查），供登录页决定是否显示注册入口。
+// 只暴露 registration_enabled 一个布尔位——注册入口本就是公开功能，不算敏感信息；仍与 login/register
+// 同挂来源 IP 限流兜底滥用。读设置失败时 fail-closed 返回 false（宁可少显示入口，也不谎报开放）。
+func (h *authHandlers) registrationStatus(c *gin.Context) {
+	settings, err := h.settings.Get(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"registration_enabled": false})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"registration_enabled": settings.RegistrationEnabled})
+}

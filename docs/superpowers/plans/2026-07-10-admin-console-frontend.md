@@ -2135,7 +2135,7 @@ git commit -m "docs: 同步 Web 控制台（第 15 步）进度与构建说明"
 
 **类型一致性核对**：`api.*` 方法签名与 `types.ts` 一致；`MeInfo.role` 联合类型 `'admin'|'user'` 在 auth store、ProtectedRoute、Layout 一致；`CreatedKey.api_key` 字段名与 PlaintextKeyModal 用法一致；`DataTable` 泛型约束 `T extends Record<string, unknown>` 与各页 `User`/`APIKey`/`Channel`/`Account` 兼容。
 
-**一处需实现时留意（已在 Task 10 Step 1 注明）**：登录页「是否显示注册入口」本期从简（始终显示，点击后由后端 403 兜底）。若要精确，后端需加一个公开的 `GET /auth/registration-status`——这属 Plan 1 的可选增强，不阻塞本计划；实现者照 Task 10 注释处理即可。
+**一处已补齐（2026-07-11）**：登录页「是否显示注册入口」原本从简（始终显示，点击后由后端 403 兜底）。现已精确化：后端新增公开只读端点 `GET /auth/registration-status`（匿名可达，同挂 IP 限流，读设置失败 fail-closed 返回 false），登录页据此决定是否渲染注册入口；查询失败时保守隐藏。
 
 ## 执行交接
 

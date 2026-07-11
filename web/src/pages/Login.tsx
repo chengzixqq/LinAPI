@@ -13,9 +13,16 @@ export default function Login() {
   const [loading, setLoading] = useState(false)
   const [canRegister, setCanRegister] = useState(false)
 
-  // 登录页也需知道是否开放注册以决定显示注册入口。
-  // /admin/settings 需鉴权，未登录拿不到，故这里始终显示入口，点击后由后端 403 兜底——更简单可靠。
-  useEffect(() => { setCanRegister(true) }, [])
+  // 登录页据后端公开端点决定是否显示注册入口：注册未开放时不显示，避免点进去才吃 403。
+  // 查询失败时保守隐藏入口（宁可少显示，也不引导用户走进一个必然失败的注册）。
+  useEffect(() => {
+    let alive = true
+    api.auth
+      .registrationStatus()
+      .then((s) => { if (alive) setCanRegister(s.registration_enabled) })
+      .catch(() => { if (alive) setCanRegister(false) })
+    return () => { alive = false }
+  }, [])
 
   const form = useForm({
     initialValues: { username: '', password: '', remember: false },

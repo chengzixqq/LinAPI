@@ -18,6 +18,9 @@ export const api = {
       }),
     logout: () => apiFetch<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
     me: () => apiFetch<MeInfo>('/auth/me'),
+    // 公开只读：登录页据此决定是否显示注册入口（无需鉴权）。
+    registrationStatus: () =>
+      apiFetch<{ registration_enabled: boolean }>('/auth/registration-status'),
   },
   admin: {
     listUsers: (limit = 100, offset = 0) =>

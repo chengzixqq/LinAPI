@@ -51,6 +51,8 @@ func newAuthTestEngine(t *testing.T) (*gin.Engine, account.AccountStore, *sessio
 	g.POST("/login", h.login)
 	g.POST("/logout", sessAuth, h.logout)
 	g.GET("/me", sessAuth, h.me)
+	// 公开只读端点：登录页据此决定是否显示注册入口（匿名可达，无需鉴权）。
+	g.GET("/registration-status", h.registrationStatus)
 	return e, accStore, sess
 }
 
@@ -63,6 +65,43 @@ func TestRegisterDisabledByDefault(t *testing.T) {
 	e.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("默认注册关闭应 403, 得到 %d", w.Code)
+	}
+}
+
+// TestRegistrationStatusReflectsSetting 验证公开的 GET /auth/registration-status：
+// 匿名可达（无需会话），如实反映 registration_enabled 开关，供登录页决定是否显示注册入口。
+// 默认关闭返回 false；打开开关后返回 true。
+func TestRegistrationStatusReflectsSetting(t *testing.T) {
+	e, accStore, _ := newAuthTestEngine(t)
+
+	// 默认：注册关闭 → registration_enabled=false。
+	req := httptest.NewRequest(http.MethodGet, "/auth/registration-status", nil)
+	w := httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("registration-status 应 200, 得到 %d; body=%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		RegistrationEnabled bool `json:"registration_enabled"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解析响应失败: %v; body=%s", err, w.Body.String())
+	}
+	if got.RegistrationEnabled {
+		t.Fatalf("默认注册关闭时应返回 false, 得到 true")
+	}
+
+	// 打开注册开关后 → registration_enabled=true。
+	_ = accStore.(*account.MemoryStore).Put(context.Background(), account.Settings{RegistrationEnabled: true})
+	req = httptest.NewRequest(http.MethodGet, "/auth/registration-status", nil)
+	w = httptest.NewRecorder()
+	e.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("registration-status 应 200, 得到 %d", w.Code)
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if !got.RegistrationEnabled {
+		t.Fatalf("注册开启后应返回 true, 得到 false")
 	}
 }
 
