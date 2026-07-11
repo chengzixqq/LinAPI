@@ -4,6 +4,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **状态（2026-07-11）**：Plan 1 后端已实现并经 codex 安全审查加固（第 15 步：CSRF/限速/自助 Key 上限/注册不发额度/会话撤销）。本前端计划已按加固后契约对齐——见下方「⚠️ 对齐加固后端（2026-07-11）」小节逐条说明。当前后端接口与安全边界以 [`../../progress.md`](../../progress.md) 为准。
+
+## ⚠️ 对齐加固后端（2026-07-11）
+
+原计划写于安全审查之前，以下几处**必须按加固后契约实现**，否则前端会被后端拒绝：
+
+1. **CSRF（最关键）**：`/me`、`/admin` 的所有写请求（POST/PUT/PATCH/DELETE）须带 `X-CSRF-Token` 头（值取自登录后下发的非 HttpOnly cookie `linapi_csrf`）+ `Content-Type: application/json` + 同源 Origin，否则 **403**。本计划 Task 3 的 `client.ts` 已含 CSRF 注入实现（读 cookie 路线）。**dev 代理 `changeOrigin` 必须为 `false`**（默认），否则 Origin 校验 403。
+2. **自助建 key 强制 `rate_limit_per_min` ∈ [1,5000]**：门户建 key（Task 13）必须提供 RPM 输入（默认 60），不能传 0。admin 代建（Task 11）不受下限约束，可传 0=不限流。
+3. **注册不发额度 + 设置页死字段**：后端注册恒发余额 0，且 `putSettings` 拒绝 `new_user_initial_balance != 0`。Settings 页（Task 12）**移除该输入框**，仅留 `registration_enabled` 开关 + 一行说明。
+4. **登录响应体多回 `csrf_token`**：`types.ts` 加为可选字段（读 cookie 路线下前端不依赖它）。
+5. **两级限速体系**（账户级可配 + 两级并发上限）是本计划**之后**的独立后端特性（见记忆 `linapi-two-tier-ratelimit`），本期前端不涉及。
+
+---
+
 **前置依赖：** 本计划依赖 Plan 1（后端认证层）已完成——`/auth`、`/me`、`/admin/accounts`、`/admin/settings` 端点可用，`/admin/*` 已切换会话鉴权。
 
 **Goal:** 构建 React + Vite + TS + Semi Design 控制台：统一登录页按角色分流，admin 五页 + user 两页，嵌入式单二进制交付（`//go:embed` + `/console` SPA 伺服）。
@@ -102,6 +116,8 @@
 
 `base: '/console/'` 让产物资源路径匹配后端伺服前缀；dev proxy 把 API 打到 8080。
 
+> **CSRF 关键**：proxy 保持 `changeOrigin: false`（Vite 默认，下方字符串简写即是）。若改成 `true`，Vite 会把请求的 Host 头改写成 `localhost:8080`，而浏览器仍发 `Origin: http://localhost:5173`，后端同源校验（§3.6）判定 Origin≠Host 直接 **403**。别为了"规范"手贱加 `changeOrigin: true`。
+
 ```ts
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -117,6 +133,8 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // 字符串简写 = changeOrigin:false，Host 不被改写，后端 CSRF 同源校验才能通过。
+    // 切勿改成 { target, changeOrigin: true } —— 会导致所有写请求 403（见上方 CSRF 关键）。
     proxy: {
       '/auth': 'http://localhost:8080',
       '/admin': 'http://localhost:8080',
@@ -406,12 +424,26 @@ export function setUnauthorizedHandler(fn: UnauthorizedHandler) {
   onUnauthorized = fn
 }
 
+// 从 document.cookie 读非 HttpOnly 的 CSRF token（登录后由后端下发 linapi_csrf）。
+// 读 cookie 而非登录响应体：刷新页面 cookie 仍在，无需前端内存态；登出清 cookie 后自然失效。
+function readCsrfToken(): string {
+  const m = document.cookie.match(/(?:^|;\s*)linapi_csrf=([^;]*)/)
+  return m ? decodeURIComponent(m[1]) : ''
+}
+
+// 非安全方法需带 CSRF token（AUD-P1-26 双重提交）；GET/HEAD/OPTIONS 后端自动放行。
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? 'GET').toUpperCase()
+  const csrfHeader: Record<string, string> =
+    SAFE_METHODS.has(method) ? {} : { 'X-CSRF-Token': readCsrfToken() }
   const resp = await fetch(path, {
     ...init,
     credentials: 'include', // 带 HttpOnly 会话 Cookie。
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/json', // 后端 CSRF 强制 application/json。
+      ...csrfHeader,
       ...(init?.headers ?? {}),
     },
   })
@@ -461,7 +493,15 @@ export interface Account {
 
 export interface Settings {
   registration_enabled: boolean
-  new_user_initial_balance: number
+  /** @deprecated AUD-P0-07：注册不发额度，后端恒 0 且拒绝非 0 写入。前端不再提供输入框。 */
+  new_user_initial_balance?: number
+}
+
+/** 登录/注册响应。csrf_token 冗余回显（读 cookie 路线下前端不依赖，保留以备用）。 */
+export interface AuthResp {
+  username: string
+  role: 'admin' | 'user'
+  csrf_token?: string
 }
 
 export interface User {
@@ -510,19 +550,19 @@ export interface ListResp<T> {
 ```ts
 import { apiFetch } from './client'
 import type {
-  Account, APIKey, Channel, CreatedKey, ListResp, MeInfo, Settings, User,
+  Account, APIKey, AuthResp, Channel, CreatedKey, ListResp, MeInfo, Settings, User,
 } from './types'
 
 // 按域聚合的端点封装。所有写操作走 JSON body。
 export const api = {
   auth: {
     login: (username: string, password: string, remember: boolean) =>
-      apiFetch<{ username: string; role: string }>('/auth/login', {
+      apiFetch<AuthResp>('/auth/login', {
         method: 'POST',
         body: JSON.stringify({ username, password, remember }),
       }),
     register: (username: string, password: string) =>
-      apiFetch<{ username: string; role: string }>('/auth/register', {
+      apiFetch<AuthResp>('/auth/register', {
         method: 'POST',
         body: JSON.stringify({ username, password }),
       }),
@@ -1432,6 +1472,10 @@ export default function Register() {
             {text.register.submit}
           </Button>
         </Form>
+        {/* AUD-P0-07：注册不发额度，明确告知避免用户误以为注册即有余额。 */}
+        <Typography.Text type="tertiary" size="small" style={{ display: 'block', textAlign: 'center', marginTop: 12 }}>
+          注册后账户初始额度为 0，需管理员充值后方可调用。
+        </Typography.Text>
         <Typography.Text link onClick={() => navigate('/login')} style={{ display: 'block', textAlign: 'center', marginTop: 16 }}>
           {text.register.toLogin}
         </Typography.Text>
@@ -1777,8 +1821,10 @@ export default function Overview() {
 - [ ] **Step 2: `Channels.tsx` — 渠道 CRUD**
 
 - 列表：`api.admin.listChannels()`；列 = channel_id / name / format(Tag) / base_url / priority / weight / enabled(Tag) / 操作。
-- 新建 + 编辑：同一 Modal 表单（编辑时 `initValues` 填充）。字段：`channel_id`（编辑时禁改）、`name`、`format`（Select：openai/anthropic）、`base_url`、`api_key`（password 输入，编辑时占位「留空则不改」——**注意**：后端 PUT 需全量字段，若留空需先 GET 原值或提示必填；本期简单起见编辑时 api_key 必填重填）、`priority`（number）、`weight`（number，≥1）、`models`（键值对编辑器，简化为 JSON textarea：对外名→上游名，空值透传）。
-- 校验：channel_id/base_url/api_key/format 必填；weight ≥ 1；models 文本须为合法 JSON 对象（提交前 `JSON.parse` 校验，失败就地红字）。
+- 新建 + 编辑：同一 Modal 表单（编辑时 `initValues` 填充）。字段：`channel_id`（编辑时禁改）、`name`、`format`（Select：openai/anthropic）、`base_url`、`api_key`（password 输入，编辑时占位「留空则不改」——**注意**：后端 PUT 需全量字段，若留空需先 GET 原值或提示必填；本期简单起见编辑时 api_key 必填重填）、`priority`（number）、`weight`（number，≥1）、`models`（**结构化键值对编辑器**，见下）。
+- **models 结构化编辑器（本期决策：渠道增强，不用裸 JSON）**：用一组可增删的行，每行两个输入框「对外模型名 → 上游模型名」（上游名留空=透传对外名）。用 `Form.Slot` + 本地 `useState<{outer:string; upstream:string}[]>` 管理行，提交时折叠成 `Record<string,string>`（`{outer: upstream}`，`upstream===''` 存空串表透传）。加「+ 添加模型」按钮、每行「删除」图标。理由：运维直接填模型名对，不用手写 JSON、不会因逗号/引号错误提交失败；比裸 textarea 少一整类用户错误。
+- 校验：channel_id/base_url/api_key/format 必填；weight ≥ 1；models 至少一行且「对外名」非空、对外名不重复（就地红字）；无需 JSON 解析（结构化编辑器天然产出合法对象）。
+- **提供「高级：JSON 模式」折叠开关**（可选增强）：把当前行序列化成 JSON 供高级用户直接粘贴/校对；解析失败就地红字，解析成功回填行编辑器。默认收起，主路径走结构化行。
 - 操作：编辑、启停（ConfirmButton 禁用）、删除（ConfirmButton「确认删除渠道？此操作不可恢复」）。删除成功 Toast + reload。
 - 渠道 api_key 列表永不显示（后端已脱敏，返回为空）。
 
@@ -1793,7 +1839,7 @@ export default function Overview() {
 - [ ] **Step 4: `Settings.tsx` — 系统设置**
 
 - 数据：`api.admin.getSettings()`。
-- 表单：`Form.Switch field="registration_enabled"`（开放注册开关）+ `Form.InputNumber field="new_user_initial_balance"`（新用户初始额度，min 0）。用 `initValues` 填充当前值。
+- 表单：仅 `Form.Switch field="registration_enabled"`（开放注册开关）。用 `initValues` 填充当前值。**不含 `new_user_initial_balance` 输入框**——该字段已废弃（AUD-P0-07 注册不发额度，后端拒绝非 0 值）；改为一行 `Typography.Text type="tertiary"` 说明："自助注册不发放额度；如需给用户额度，请到「用户管理」建号或充值。"
 - 保存：`api.admin.putSettings(values)` → Toast「保存成功」。保存按钮 loading 态。
 - 三态：加载中 Spin；错误 + 重试；有数据渲染表单（无空态）。
 
@@ -1824,8 +1870,11 @@ export default function Settings() {
       <Typography.Title heading={5} style={{ marginBottom: 16 }}>{text.nav.settings}</Typography.Title>
       <Form onSubmit={save} initValues={data} style={{ maxWidth: 480 }}>
         <Form.Switch field="registration_enabled" label="开放注册" />
-        <Form.InputNumber field="new_user_initial_balance" label="新用户初始额度" min={0} style={{ width: '100%' }} />
-        <Button htmlType="submit" type="primary" theme="solid" loading={saving} style={{ marginTop: 12 }}>{text.common.save}</Button>
+        {/* new_user_initial_balance 已废弃（AUD-P0-07）：注册恒不发额度，后端拒绝非 0 值，故不提供输入框。 */}
+        <Typography.Text type="tertiary" style={{ display: 'block', margin: '4px 0 12px' }}>
+          自助注册不发放额度；如需给用户额度，请到「用户管理」建号或充值。
+        </Typography.Text>
+        <Button htmlType="submit" type="primary" theme="solid" loading={saving}>{text.common.save}</Button>
       </Form>
     </>
   )
@@ -1897,11 +1946,11 @@ export default function PortalHome() {
 - [ ] **Step 2: `PortalKeys.tsx` — 我的密钥（建/启停/删 + 明文一次性）**
 
 - 列表：`api.me.listKeys()`；列 = key_id / rate_limit_per_min / enabled(Tag) / 操作（启停 ConfirmButton + 删除 ConfirmButton）。
-- 建 key：按钮 → `api.me.createKey(0, [])` → 明文 PlaintextKeyModal 一次性显示 → reload。
+- 建 key：按钮 → **弹 Modal 填 `rate_limit_per_min`（默认 60，min 1 / max 5000，前置校验）** → `api.me.createKey(rpm, [])` → 明文 PlaintextKeyModal 一次性显示 → reload。**不能像旧稿传 0**——后端强制自助建 key 的 RPM ∈ [1,5000]（AUD-P1-28），传 0/超限会 400。
 - 删除：ConfirmButton「确认删除此密钥？删除后使用该密钥的请求将立即失败」→ `api.me.deleteKey(key_id)` → Toast + reload。
 
 ```tsx
-import { Button, Space, Tag, Toast, Typography } from '@douyinfe/semi-ui'
+import { Button, Form, Modal, Space, Tag, Toast, Typography } from '@douyinfe/semi-ui'
 import { useState } from 'react'
 import { api } from '../../api/endpoints'
 import type { APIKey } from '../../api/types'
@@ -1914,12 +1963,18 @@ import { text } from '../../text'
 export default function PortalKeys() {
   const { data, loading, error, reload } = useAsyncData(() => api.me.listKeys().then((r) => r.data))
   const [plaintext, setPlaintext] = useState<string | null>(null)
+  const [formVisible, setFormVisible] = useState(false)
   const [creating, setCreating] = useState(false)
 
-  const createKey = async () => {
+  // 自助建 key 必须带 rate_limit_per_min（后端强制 1..5000，AUD-P1-28）。
+  const createKey = async (values: { rate_limit_per_min: number }) => {
     setCreating(true)
-    try { const c = await api.me.createKey(0, []); setPlaintext(c.api_key); reload() }
-    catch (e) { Toast.error(e instanceof Error ? e.message : '创建失败') }
+    try {
+      const c = await api.me.createKey(values.rate_limit_per_min, [])
+      setFormVisible(false)
+      setPlaintext(c.api_key)
+      reload()
+    } catch (e) { Toast.error(e instanceof Error ? e.message : '创建失败') }
     finally { setCreating(false) }
   }
 
@@ -1949,9 +2004,19 @@ export default function PortalKeys() {
     <>
       <DataTable<APIKey>
         columns={columns} data={data} loading={loading} error={error} onReload={reload} rowKey="key_id"
-        toolbar={<TableToolbar title={text.nav.portalKeys} actions={<Button type="primary" loading={creating} onClick={createKey}>生成新密钥</Button>} />}
+        toolbar={<TableToolbar title={text.nav.portalKeys} actions={<Button type="primary" onClick={() => setFormVisible(true)}>生成新密钥</Button>} />}
       />
       <Typography.Text type="tertiary" style={{ display: 'block', marginTop: 8 }}>明文仅在创建时显示一次，请及时保存。</Typography.Text>
+
+      <Modal title="生成新密钥" visible={formVisible} onCancel={() => setFormVisible(false)} footer={null}>
+        <Form onSubmit={createKey} initValues={{ rate_limit_per_min: 60 }}>
+          {/* 后端强制 1..5000：0/负数会被限流层当作“不限流”，超大值绕过平台限流。 */}
+          <Form.InputNumber field="rate_limit_per_min" label="每分钟请求上限 (RPM)" min={1} max={5000} step={10}
+            rules={[{ required: true, message: '请输入 1..5000 的限流值' }]} style={{ width: '100%' }} />
+          <Button htmlType="submit" type="primary" theme="solid" loading={creating} style={{ marginTop: 12 }}>创建</Button>
+        </Form>
+      </Modal>
+
       <PlaintextKeyModal apiKey={plaintext ?? ''} visible={plaintext !== null} onClose={() => setPlaintext(null)} />
     </>
   )
@@ -2051,6 +2116,13 @@ git commit -m "docs: 同步 Web 控制台（第 15 步）进度与构建说明"
 - 主色定制不裸用默认皮肤 → Task 5 tokens.css ✅
 - 越权：`/me/keys` 不传 user_id → Task 3 endpoints（me.createKey 无 user 参数）✅
 - 前端非安全边界（后端授权）→ Task 7 ProtectedRoute 注释 + Task 13 验证 ✅
+
+**加固后端对齐核对（2026-07-11，见顶部「⚠️ 对齐加固后端」）**：
+- CSRF 双重提交：`client.ts` `apiFetch` 读 `linapi_csrf` cookie 注入 `X-CSRF-Token`（非安全方法）→ Task 3 Step 1 ✅
+- dev 代理 `changeOrigin:false` 防 Origin 校验 403 → Task 1 Step 2 vite.config 注释 ✅
+- 自助建 key 强制 RPM ∈ [1,5000]：PortalKeys 建 key Modal 带 `rate_limit_per_min`（默认 60，min1/max5000）→ Task 13 ✅
+- 注册不发额度：Settings 页移除 `new_user_initial_balance` 输入框 + 说明；Register 页提示初始额度 0 → Task 12 / Task 10 Step 2 ✅
+- 渠道 models 结构化编辑器（对外名→上游名行编辑，非裸 JSON）→ Task 11 Step 2 ✅
 
 **占位符扫描**：脚手架/配置/API/共享组件/登录页/用户页/概览页/设置页/门户页均为完整代码；渠道页与账户页以完整列/字段/校验/端点/硬指标规格给出（复用已给完整代码的共享组件与 Users 样板），无 TBD/TODO。
 

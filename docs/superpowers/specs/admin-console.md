@@ -1,6 +1,6 @@
 # LinAPI 管理控制台设计文档（Admin Console + 统一认证）
 
-> 状态（2026-07-11）：Plan 1 后端已实现，Plan 2 前端尚待执行；本文保留为 2026-07-10 的设计基线，涉及裸 token、未实现清单等前置状态的段落均为历史上下文，当前状态以 [`../../progress.md`](../../progress.md) 与审查跟踪表为准。
+> 状态（2026-07-11）：Plan 1 后端已实现并经 codex 安全审查加固（第 15 步）；Plan 2 前端待执行。本文已按加固后的后端契约对齐（§3.6 CSRF 落地、注册不发额度、自助建 key 强制 1..5000）。涉及裸 token、未实现清单等前置状态的段落为历史上下文；当前状态以 [`../../progress.md`](../../progress.md) 与审查跟踪表为准。
 > 日期：2026-07-10
 > 范围：为 LinAPI 网关新增一个 Web 管理控制台，并为其补齐统一账户认证体系（账户/密码/角色/会话）。前端 React + Vite + TypeScript + Semi Design，以嵌入式单二进制形态随 Go 后端交付。
 
@@ -159,7 +159,7 @@ CREATE TABLE IF NOT EXISTS settings (
 | key | 类型 | 默认 | 说明 |
 |-----|------|------|------|
 | `registration_enabled` | bool | **false** | 安全默认：开放前须管理员显式打开 |
-| `new_user_initial_balance` | int64 | **0** | 新注册用户初始赠送额度（最小计费单位） |
+| `new_user_initial_balance` | int64 | **0** | ~~新注册用户初始赠送额度~~ **已废弃（AUD-P0-07）**：自助注册恒不发额度，后端 `putSettings` 拒绝非 0 值。保留列仅为兼容，恒 0 |
 
 ### 3.3 领域层与存储
 
@@ -183,9 +183,23 @@ CREATE TABLE IF NOT EXISTS settings (
 
 ### 3.6 CSRF 防护
 
-- HttpOnly Cookie 会被浏览器自动带上，理论上需防 CSRF。
-- 但本期是**同源嵌入式部署**（`/console` 与 API 同域）+ **SameSite=Strict**，跨站请求根本带不上 Cookie，已基本免疫 CSRF。
-- 因此**不额外加 CSRF token**（在同源部署下属过度设计）。此结论写明于此，将来若改为跨域分离部署需重新评估。
+> 状态（2026-07-11 对齐）：本节原设计为"同源部署免 CSRF"，已被安全审查 AUD-P1-26 推翻并落地了完整防护。以下为**当前后端真实契约**，前端必须遵守。
+
+会话用 Cookie 承载，浏览器会自动带上，因此写操作需防 CSRF。后端 [`middleware.CSRFProtect`](../../../internal/middleware/csrf.go) 对**所有 Cookie 鉴权的写请求**（`/me`、`/admin` 的 POST/PUT/PATCH/DELETE）强制三道校验，缺一即 **403**：
+
+1. **双重提交 token**：请求头 `X-CSRF-Token` 必须等于会话里绑定的 `CSRFToken`。攻击者跨站既读不到受害者的 CSRF cookie，也设不了自定义请求头。
+2. **强制 `application/json`**：挡住攻击页用 `text/plain` 简单表单免预检构造合法 body。
+3. **精确同源 Origin**：带 `Origin` 头时其 host 必须等于请求 Host（`SameSite=Strict` 对同站不同子域仍带 Cookie，不能只靠它）。
+
+安全方法（GET/HEAD/OPTIONS）自动放行。
+
+**token 下发与前端取用**：登录成功后，后端同时：
+- 下发一个**非 HttpOnly** 的 `linapi_csrf` Cookie（`SameSite=Strict`），供前端 JS 读取；
+- 在登录响应体回 `csrf_token` 字段（冗余，前端可忽略）。
+
+**前端约定（本期决策：读 cookie）**：`apiFetch` 在每次写请求前从 `document.cookie` 读 `linapi_csrf`，注入 `X-CSRF-Token` 头。读 cookie 而非存登录响应体，好处是刷新页面（cookie 仍在）无需前端内存态，登出清 cookie 后自然失效。
+
+**dev 代理注意**：Vite proxy 必须保持 `changeOrigin: false`（默认）。若改成 true，请求 Host 被改写为后端地址、而 `Origin` 仍是前端 5173，后端同源校验会 403。
 
 ### 3.7 分组 / 倍率预留字段（本期存而不用）
 
@@ -211,7 +225,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
-| POST | `/auth/register` | 无（受 `registration_enabled` 开关） | `{username, password}` → 校验唯一 + 密码强度 → 建 user 账户 + 计费实体 → 初始余额取 `new_user_initial_balance`。开关关闭时返回 403 |
+| POST | `/auth/register` | 无（受 `registration_enabled` 开关） | `{username, password}` → 校验唯一 + 密码强度 → 建 user 账户 + 计费实体 → **初始余额恒为 0**（AUD-P0-07：注册不发额度）。开关关闭时返回 403；用户名已存在时也返回与成功一致的响应，不泄露存在性（AUD-P2-21） |
 | POST | `/auth/login` | 无 | `{username, password, remember?}` → 校验 → 建 session → 下发 HttpOnly Cookie。返回 `{username, role}`（供前端分流） |
 | POST | `/auth/logout` | session | 删 Redis session + 清 Cookie |
 | GET | `/auth/me` | session | 返回 `{username, role, external_id}`。前端刷新 / 直接进入时用它恢复会话（Cookie 在但前端内存态已丢） |
@@ -268,8 +282,8 @@ admin:
 对齐 New API「注册即有额度容器」：
 
 - 无论**自助注册**还是 **admin 创建 user 账户**，都自动创建一个计费 `User` 并回填 `external_id`（用 username 或生成的 ID）。
-  - **自助注册**：初始余额取 `new_user_initial_balance`。
-  - **admin 创建**：admin 可在创建表单显式指定初始余额（缺省时取 `new_user_initial_balance`）。
+  - **自助注册**：初始余额**恒为 0**（AUD-P0-07：注册不发额度，杜绝注册即克隆免费额度）。要给用户额度只能走管理面主动建号 / 充值。
+  - **admin 创建**：admin 可在创建表单显式指定初始余额（可信操作，不受上述限制）。
 - 用户登录即有额度容器，可立刻建 key。
 - **admin 账户不自动建计费实体**（不消耗额度，`external_id` 可空）。
 - **`external_id` 由后端自动生成 / 回填，非前端手填**：建 user 账户是「建账户 + 自动建计费实体 + 回填关联」的原子动作，前端不提供 external_id 输入框。
@@ -287,9 +301,12 @@ admin:
 |------|------|------|
 | GET | `/me/profile` | 自己的账户信息 + 关联计费 User 余额 |
 | GET | `/me/keys` | 自己名下密钥列表（脱敏，不回显明文） |
-| POST | `/me/keys` | 自助创建密钥，明文仅回显一次 |
+| POST | `/me/keys` | 自助创建密钥，明文仅回显一次。**`rate_limit_per_min` 必填且强制 1..5000**（AUD-P1-28：0/负数=不限流、超大值绕过平台限流，均拒绝）；每账户至多 50 把 key（存储层原子约束，超限 409） |
 | PATCH | `/me/keys/:keyid/enabled` | 启停自己的密钥 |
 | DELETE | `/me/keys/:keyid` | 删除自己的密钥 |
+
+> **前端建 key 表单（本期决策）**：门户建 key 需提供 `rate_limit_per_min` 输入（默认 60，min 1 / max 5000，提交前客户端校验），不能像旧计划那样传 0。admin 代建（`/admin/users/:id/keys`）不受 1..5000 下限约束（面向运维，允许 0=不限流）。
+> **与将来两级限速的关系**：本期单 key 只设 RPM。将来的"两级限速体系"（账户级可配 + 两级并发上限，见项目记忆 `linapi-two-tier-ratelimit`）是独立后端特性，排在本前端计划之后，届时再给建 key 表单加并发字段。
 
 ### 5.4 越权硬约束（不可协商，写进实现与测试）
 
@@ -313,7 +330,7 @@ admin:
 - `/console/users` — 用户 + 密钥管理：用户表（列表 / 分页 / 创建 / 启停 / 充值），抽屉或展开区管该用户密钥（生成 / 列表 / 启停，明文弹窗仅显示一次）。
 - `/console/channels` — 渠道管理：渠道表（列表 / 创建 / 编辑 / 删除 / 启停，含 format / base_url / 优先级 / 权重 / 模型映射）。
 - `/console/accounts` — 账户管理：管理登录账户（创建 admin / user 账户、改密、启停）。创建 user 账户时后端自动建并绑定计费实体（见 5.1），admin 可指定初始余额；表单不含 external_id 手填项。认证体系必需的管理面。
-- `/console/settings` — 系统设置：`registration_enabled` 开关 + `new_user_initial_balance`（即时生效）。
+- `/console/settings` — 系统设置：`registration_enabled` 开关（即时生效）。**不含 `new_user_initial_balance` 输入框**——该字段已废弃（AUD-P0-07 注册不发额度），后端拒绝非 0 值；页面改为一行说明"自助注册不发放额度，发额度请到用户管理主动建号 / 充值"。
 
 **用户门户（user 角色）**
 - `/console/portal` — 我的概览（余额 / 账户信息）。
@@ -376,17 +393,22 @@ admin:
 | POST | `/admin/accounts/:id/password` | session | admin |
 | GET | `/admin/settings` | session | admin |
 | PUT | `/admin/settings` | session | admin |
+| GET·POST | `/admin/users`、`/admin/users/:id`、`/admin/users/:id/enabled`、`/admin/users/:id/balance` | session | admin |
+| GET·POST·PATCH | `/admin/users/:id/keys`、`/admin/keys/:keyid/enabled` | session | admin |
+| CRUD | `/admin/channels`、`/admin/channels/:id`(GET/PUT/DELETE)、`/admin/channels/:id/enabled` | session | admin |
 | GET | `/console/*` | 无（静态） | — |
+
+> **CSRF（AUD-P1-26）**：上表所有 `/me` 与 `/admin` 的**写方法**（POST/PUT/PATCH/DELETE）除 session 外，还须带 `X-CSRF-Token` 头 + `application/json` + 同源 Origin（见 §3.6）。GET 自动放行。
 
 ### 鉴权变更
 
 | 路径 | 原 | 新 |
 |------|----|----|
-| `/admin/*`（现有 CRUD） | 裸 admin token | `SessionAuth` + `RequireRole("admin")` |
+| `/admin/*`（现有 CRUD） | 裸 admin token | `SessionAuth`(带会话代次校验) + `RequireRole("admin")` + `CSRFProtect`（写方法） |
 
 ### 不变
 
-`/v1/*`（API key）、`/healthz`、`/metrics`、现有 `/admin` 的用户 / 密钥 / 渠道 CRUD 处理逻辑（仅鉴权层变）。
+`/v1/*`（API key）、`/healthz`、`/metrics`，以及现有 `/admin` 用户 / 密钥 / 渠道 CRUD 的**业务处理逻辑**（仅鉴权层改为会话 + 角色 + CSRF）。
 
 ---
 
@@ -406,6 +428,8 @@ admin:
 
 **前端**
 - [ ] 统一登录页按角色分流；`/auth/me` 恢复会话；401 统一踢回登录。
+- [ ] **CSRF：`apiFetch` 写请求从 `linapi_csrf` cookie 读 token 注入 `X-CSRF-Token`；写操作不再被后端 403**（AUD-P1-26）。dev 代理 `changeOrigin:false`。
+- [ ] **自助建 key 表单含 `rate_limit_per_min`（默认 60，1..5000 前置校验）；设置页无 `new_user_initial_balance` 输入框**。
 - [ ] admin 五页 + user 两页齐全，导航按角色渲染。
 - [ ] 六节四硬指标（三态 / 反馈 / 校验 / 响应式）逐页满足。
 - [ ] 密钥明文仅回显一次交互正确；掩码显示。
