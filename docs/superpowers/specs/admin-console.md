@@ -17,10 +17,10 @@
 
 ### 对标参考
 
-- **New API**（React + Semi Design，后端 Go）：本期前端路线与用户模型的主要对标对象。
+- **New API**（React + Semi Design，后端 Go）：本期前端路线与用户模型的主要对标对象（形态对标，非视觉对标）。
 - **sub2api**（Vue 3，后端 Go）：用户自助形态参考。
 
-两者均验证了「Go 后端 + 独立前端 + 用户自助建 key 消耗自身额度」这一形态；本期选 React + Semi 对齐 New API。
+两者均验证了「Go 后端 + 独立前端 + 用户自助建 key 消耗自身额度」这一形态；本期对标其**形态**，但 UI 组件库刻意改用 Mantine（而非 New API 同款 Semi），从组件体系到主色都与之无关联，规避抄袭观感。
 
 ### 非目标（本期明确不做）
 
@@ -41,7 +41,7 @@
 |----|------|
 | 前端框架 | React 18 |
 | 构建工具 | Vite + TypeScript |
-| UI 组件库 | Semi Design（`@douyinfe/semi-ui`） |
+| UI 组件库 | Mantine（`@mantine/core` + form/hooks/modals/notifications） |
 | 前端路由 | react-router |
 | 后端 | Go + Gin（现有，扩展认证层） |
 | 会话存储 | Redis（现有） |
@@ -340,8 +340,8 @@ admin:
 
 ### 6.2 主题与视觉基调
 
-- 基于 Semi Design Token 定制，**不裸用默认皮肤**（默认皮肤 = 平庸的关键）。定一套主色（中性偏冷，避开 AntD 经典蓝的「满大街感」）+ 统一圆角、阴影层级。
-- **暗色模式一等公民**：Semi 原生 Token 切换，跟随系统 + 手动切换，选择持久化。
+- 基于 Mantine 主题 Token 定制（`createTheme`），**不裸用默认皮肤**（默认皮肤 = 平庸的关键）。主色用 violet（紫），刻意避开 Semi/AntD 经典蓝的「满大街感」，也与 New API 的 Semi 蓝拉开距离；统一大圆角与阴影层级。
+- **暗色模式一等公民**：Mantine color scheme 机制切换，跟随系统 + 手动切换，选择持久化（`index.html` 内联脚本防首屏闪烁）。
 - 排版四级层级（页面标题 / 区块标题 / 正文 / 辅助文字）字号字重固定成规范，全站一致。
 
 ### 6.3 布局骨架
@@ -448,6 +448,6 @@ admin:
 
 1. **后端认证地基**：`accounts` / `settings` 表（含预留列 `accounts.group_name`；并给现有 `users` 表加 `rate_multiplier`）+ `internal/account` 双实现 + bcrypt + Redis session + `SessionAuth` / `RequireRole` + bootstrap（含单测）。
 2. **认证端点**：`/auth/*`、`/me/*`、`/admin/accounts`、`/admin/settings`；`/admin/*` 切换会话鉴权、清理裸 token（含单测，重点覆盖越权硬约束）。
-3. **前端工程搭建**：Vite + React + TS + Semi 脚手架、API 客户端 + 类型、布局 + 受保护路由 + 主题、`console.go` embed。
+3. **前端工程搭建**：Vite + React + TS + Mantine 脚手架、API 客户端 + 类型、布局 + 受保护路由 + 主题、`console.go` embed。
 4. **前端页面**：登录 / 注册 → admin 五页 → user 两页，逐页落实四硬指标。
 5. **收尾**：端到端验证、`-race`、文档与记忆同步。

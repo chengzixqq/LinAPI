@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LinAPI 控制台</title>
+    <script>
+      // Mantine 防暗色首屏闪烁：在 React 挂载前，按持久化/系统偏好预置 data-mantine-color-scheme。
+      // 等价于官方 <ColorSchemeScript>，但用原生脚本以适配 Vite 的静态 index.html。
+      (function () {
+        try {
+          var key = 'mantine-color-scheme-value'
+          var stored = localStorage.getItem(key)
+          var scheme =
+            stored === 'light' || stored === 'dark'
+              ? stored
+              : window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light'
+          document.documentElement.setAttribute('data-mantine-color-scheme', scheme)
+        } catch (e) {
+          /* localStorage 不可用时静默降级为默认浅色 */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

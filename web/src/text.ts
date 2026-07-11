@@ -1,0 +1,53 @@
+// 集中中文文案。散落文案是 i18n 的敌人；本期中文优先，但集中放置，
+// 将来接 i18n 只需把此对象换成 t() 查表。
+export const text = {
+  appName: 'LinAPI 控制台',
+  login: {
+    title: '登录',
+    username: '用户名',
+    password: '密码',
+    remember: '记住我',
+    submit: '登录',
+    toRegister: '还没有账户？去注册',
+    failed: '用户名或密码错误',
+  },
+  register: {
+    title: '注册',
+    submit: '注册',
+    toLogin: '已有账户？去登录',
+    pwTooShort: '密码至少 8 位',
+    success: '注册成功，请登录',
+  },
+  nav: {
+    overview: '概览',
+    users: '用户管理',
+    channels: '渠道管理',
+    accounts: '账户管理',
+    settings: '系统设置',
+    portalHome: '我的概览',
+    portalKeys: '我的密钥',
+    logout: '退出登录',
+  },
+  common: {
+    create: '新建',
+    edit: '编辑',
+    delete: '删除',
+    enable: '启用',
+    disable: '禁用',
+    confirm: '确认',
+    cancel: '取消',
+    save: '保存',
+    empty: '暂无数据',
+    loadError: '加载失败',
+    retry: '重试',
+    saved: '保存成功',
+    deleted: '删除成功',
+    noPermission: '无权限访问',
+  },
+  key: {
+    plaintextTitle: '密钥创建成功',
+    plaintextWarn: '请立即复制并妥善保存。此明文仅显示这一次，关闭后无法再查看。',
+    copy: '复制',
+    copied: '已复制',
+  },
+} as const

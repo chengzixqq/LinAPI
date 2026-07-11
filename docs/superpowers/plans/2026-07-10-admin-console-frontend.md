@@ -1,6 +1,13 @@
 # LinAPI 管理控制台 — 前端实现计划（Plan 2/2）
 
-> **状态（2026-07-11）**：Plan 1 后端已实现；Plan 2 前端尚未启动。本文件是待执行的前端计划，当前后端接口与安全边界以 [`../../progress.md`](../../progress.md) 为准。
+> **⚠️ 实现已换 UI 库（2026-07-11）——本文档为历史归档，勿按其 Semi 代码复现**
+> 本计划最初以 `@douyinfe/semi-ui` 编写，后因"与 New API 观感雷同、涉嫌抄袭"改用 **Mantine** 落地。
+> 下文所有 Semi 组件代码块（`@douyinfe/semi-*`、`Form`/`SideSheet`/`Toast`/`Popconfirm`/`ColumnProps` 等）
+> **只反映当时的技术选型，与仓库实际源码不再一致**。前端当前真实状态（Mantine 组件映射、theme、
+> DataTable 自实现分页、useForm 类型标注等）以 [`../../progress.md`](../../progress.md) 第 16 步与记忆
+> `linapi-progress` 为准。本文保留仅为记录页面结构、路由划分与后端契约对齐决策（这些与 UI 库无关，仍有效）。
+
+> **状态（2026-07-11）**：Plan 1 后端已实现；Plan 2 前端**已完成**（React + Mantine，已 embed，构建门禁全绿）。当前后端接口与安全边界以 [`../../progress.md`](../../progress.md) 为准。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -24,7 +31,7 @@
 
 **Architecture:** 前端源码在 `web/`，`npm run build` 产物输出到 `internal/server/web_dist/`，Go 用 `//go:embed` 打进二进制，`console.go` 挂 `/console/*` 伺服静态资源并带 SPA fallback。开发期用 Vite proxy 把 `/auth /admin /me /v1` 代理到 8080。会话靠 HttpOnly Cookie，前端用 `/auth/me` 探活恢复登录态。
 
-**Tech Stack:** React 18、Vite、TypeScript、`@douyinfe/semi-ui`、react-router-dom v6。
+**Tech Stack:** React 18、Vite、TypeScript、**Mantine**（原计划为 `@douyinfe/semi-ui`，实现时改用 Mantine，见顶部归档说明）、react-router-dom v6。
 
 ## Global Constraints
 

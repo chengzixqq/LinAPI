@@ -176,6 +176,16 @@
 - **网络与凭证**：P1-31/P1-32/P1-34、P2-24 已落实 URL+拨号双层 SSRF、Redis TLS/ACL/session digest、鉴权前 IP/并发闸门、内部 request ID/header 上限与 go-redis v9.7.3。真实 Redis TLS 集成尚未执行。
 - **管理/数据契约**：P1-18、P2-06、P2-08～13/P2-15/P2-18～21 已按参数边界、原子快照、Unicode/bcrypt、账户不变量、PG/内存错误与数值语义、Redis TIME、唯一性/时间/溢出、注册枚举方向修复；P2-10 迁移框架代码完成但真实 PG 未验。
 
+### 第 16 步 · 控制台前端（Plan 2，React + Mantine，已 embed）
+- 技术栈：Vite 5 + React 18 + TypeScript + `@mantine/core`（配 `@mantine/form`/`hooks`/`modals`/`notifications` + `@tabler/icons-react`）。产物 `vite build` 输出到 `internal/server/web_dist`，由 `console.go` 的 `//go:embed all:web_dist` 打进二进制，`/console/*` 伺服 + SPA fallback（仅 `admin.enabled=true` 挂载，与认证端点同开关）。
+- 目录 `web/`：`src/api`（client 注入 CSRF + 401 处理 / types / endpoints）、`src/stores/auth.tsx`（会话态）、`src/theme`（Mantine `createTheme`：主色 violet + 大圆角，`global.css` 布局补充）、`src/notify.ts`（Toast 等价封装）、`src/components`（ProtectedRoute/Layout/DataTable/ConfirmButton/PlaintextKeyModal）、`src/pages`（Login/Register + admin: Overview/Users/Channels/Accounts/Settings + portal: PortalHome/PortalKeys）。
+- **UI 选型（规避抄袭观感）**：刻意避开 New API 同款 `@douyinfe/semi-ui`，换用 Mantine——组件库与视觉体系与 New API 无关联；主色 violet（非 Semi/AntD 默认蓝）、圆角加大差异化。暗色模式用 Mantine color scheme 机制（自带持久化 + 跟随系统 + `index.html` 防闪烁内联脚本）。业务逻辑层（`api`/`hooks`/`stores`/`text.ts`）与 UI 无关，换皮零改动。
+- **CSRF 对接**：`api/client.ts` 非安全方法自 Cookie 读 CSRF token 注入 `X-CSRF-Token`，与后端 `CSRFProtect` 双重提交对齐；dev 用 vite proxy 字符串简写（`changeOrigin:false`）保持同源，Host 不改写，避免写请求 403。
+- **契约对齐**：注册页明示"初始额度 0"（AUD-P0-07），设置页移除 `new_user_initial_balance` 输入（后端恒 0 且拒绝非 0 写入）；自助建 key 表单限速 1..5000、默认 60（对齐 me_handlers 硬约束）。
+- **构建门禁全绿**：`npm run build`（`tsc -b && vite build`，7002 模块）、`go build ./...`、`go test ./internal/server/...` 全通过。Mantine 迁移要点：`DataTable` 基于 `Table` 基元 + 客户端分页自实现并保留 `ColumnDef`（title/dataIndex/render）抽象让页面零改动；`Popconfirm`→`modals.openConfirmModal`、`SideSheet`→`Drawer`、`Form`→`@mantine/form`；渠道表单 `useForm<ChannelFormValues>` 显式标注保住 `format` 字面量联合。
+- **API 端到端已验（2026-07-11，运行中网关 `config.dev.yaml`）**：预编译 `bin/linapi.exe` + `cmd/devredis` 起本地栈，对活网关跑通 login→me→CSRF 拦截/放行→登出全链路，并逐项验证本轮安全批次：CSRF 写请求缺 `X-CSRF-Token` 403 / 带正确 token 201；P0-07 开注册后自助注册新用户余额恒 0；P1-28 建 key 限速 0/6000 越界 400、60 合法 201 且明文只回显一次；P1-17 admin 改密后旧会话立即 401、新密码可登录。构建门禁全绿（typecheck / go build / vite build 7002 模块 / go vet）。
+- **待验收边界**：真机浏览器可视化 UI 走查（点击式）本轮未做——chrome-devtools MCP 写死找 Chrome，本机仅 Edge 150，改由用户在 Edge 手动按自测清单点检；功能契约已由上述 API 端到端覆盖。打包体积单 chunk >500KB（未做 code-split，非阻塞）。
+
 ## 测试现状
 
 - 2026-07-11 当前工作区已新增 breaker generation/neutral、协议 union/developer/tool/choices、HTTP/SSE timeout、SSRF、登录/Key 限额、Redis TLS/session digest、渠道加密、迁移、协议错误、metrics 预算等回归；最终提交以根任务本轮全量 go test/vet/race 结果为准。
@@ -190,7 +200,7 @@
 当前实现已可用且具备基本运维能力（管理面 / 指标 / 热重载 / 直通优化已落地）。以下为仍可继续的增强：
 - **计费上线验证不是可选增强**：旧余额人工对账与真实 PostgreSQL 故障注入尚未完成，完成前不得把 release 部署视为财务正确性已验收。
 - **链路追踪**：结构化访问日志（`RequestLogger`，request_id 贯通）+ Prometheus 指标已铺开，但尚无分布式追踪（OpenTelemetry span 传播）。
-- **控制台前端**：本轮完成的是控制台**后端**（`/auth` `/me` `/admin`）；登录页 / 管理控制台 UI / 用户面板属另一份前端计划（Plan 2），尚未实现。
+- **控制台前端**：✅ 已完成（第 16 步）。React + Mantine 控制台已 embed 进二进制，`/console/*` 伺服；登录/注册 + admin 管理台（概览/用户/渠道/账户/设置）+ user 面板（我的概览/我的密钥）齐备。UI 刻意避开 New API 同款 Semi 以规避抄袭观感。真实浏览器端到端联调待跑。
 - **安全上线验证**：真实 Redis TLS/ACL 集成、真实 PG 迁移/故障注入、渠道明文维护迁移与历史 key 轮换尚未完成；这些不是可选增强。
 - **认证后续增强**：基础 IP/标识/bcrypt/会话/账户总桶/原子 Key 上限已落地；更细粒度 RBAC、专用安全审计日志与可选 MFA 属后续增强。
 - **更多供应商适配器**：当前 openai / anthropic 两家；Gemini 等可按注册机制扩展。

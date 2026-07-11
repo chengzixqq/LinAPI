@@ -7,6 +7,7 @@
 # 本地配置（含密钥，勿提交）
 config.yaml
 *.local.yaml
+config.dev.yaml
 .env
 
 # 依赖 / 缓存
@@ -27,3 +28,8 @@ Thumbs.db
 
 # codegraph 本地索引
 .codegraph/
+
+# 前端产物（由 npm run build 生成后 embed）
+web/node_modules
+internal/server/web_dist/*
+!internal/server/web_dist/.gitkeep

@@ -1,0 +1,15 @@
+# 依赖
+node_modules
+
+# 构建产物（实际输出到 ../internal/server/web_dist，由后端 embed）
+dist
+
+# tsc -b 增量缓存（已重定向到 node_modules/.tmp，此处兜底）
+*.tsbuildinfo
+
+# tsc 对 vite.config.ts 的意外 JS 产物（noEmit 已阻止，此处兜底）
+vite.config.js
+vite.config.d.ts
+
+# 日志
+*.log

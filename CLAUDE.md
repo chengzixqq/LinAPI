@@ -40,6 +40,12 @@ go test ./internal/routing/ -run TestBreaker -v
 # 依赖整理
 go mod tidy
 
+# 控制台前端（源码在 web/，产物 embed 进二进制）
+cd web && npm install          # 首次
+cd web && npm run dev          # 本地开发（:5173，proxy 到 :8080）
+cd web && npm run typecheck    # tsc -b 类型门禁
+cd web && npm run build        # 产物→ internal/server/web_dist，改前端后必跑
+
 # 存活 / 就绪检查
 curl http://localhost:8080/livez
 curl http://localhost:8080/readyz
@@ -106,7 +112,8 @@ release 验证每个模型显式配置普通输入、输出、缓存创建、缓
 ## 目录约定
 
 - `cmd/linapi/`：入口，负责配置加载、启动、渠道加载喂给 router、渠道定时热重载 goroutine（DB 模式）、SIGINT/SIGTERM 优雅关闭（30s 超时）。空导入 `_ "linapi/internal/adapter/all"` 触发适配器注册。
-- `internal/server/`：Gin 路由与 HTTP 资源边界。默认不信任代理头；配置读/闲置/body/header 上限，提供 `/livez` 与强依赖 `/readyz`；`/metrics` 需要 token 并有最大并发与超时。整流不设 `WriteTimeout`，SSE 使用逐次写 deadline。
+- `internal/server/`：Gin 路由与 HTTP 资源边界。默认不信任代理头；配置读/闲置/body/header 上限，提供 `/livez` 与强依赖 `/readyz`；`/metrics` 需要 token 并有最大并发与超时。整流不设 `WriteTimeout`，SSE 使用逐次写 deadline。`console.go` 用 `//go:embed all:web_dist` 伺服控制台前端（`/console/*` + SPA fallback，仅 `admin.enabled=true`）。
+- `web/`：控制台前端（Vite + React + TS + Mantine）。源码 `src/`（api/stores/theme/components/pages），`npm run build` 产物输出到 `internal/server/web_dist` 供 embed。`node_modules` 与 `web_dist` 已 gitignore。
 - `internal/forwarder/`：唯一发起上游 HTTP 的胶水层。负责最坏成本预授权、候选输出字段、SSRF/拨号策略、响应头/SSE idle/下行写期限、协议错误转换和计费。OpenAI 只支持 `n=1`，异常多 choices/index 显式拒绝且不跨渠道重试。
 - `internal/middleware/`：协议错误上下文、body/recovery、API Key 前置并发闸门、来源 IP/登录标识/账户/单 Key 限流、会话代次/活跃上限、角色、CSRF、内部 request id、日志与指标。
 - `internal/billing/`：定价策略、持久预授权、Ledger 状态机与启动恢复；生产使用 PostgresLedger，MemoryLedger 只供 debug/测试。
@@ -125,6 +132,8 @@ release 验证每个模型显式配置普通输入、输出、缓存创建、缓
 **运维增强（第 8 步之后）**：⑨ 管理面 CRUD 与渠道热更新 ⑩ Prometheus 指标 ⑪ `/v1/models` ⑫ 同格式直通（请求做输出上限/stream usage 的最小保真合并，响应短路 canonical；仍解码 usage）⑬ 结构化访问日志。入口忽略入站 `X-Request-Id` 并生成内部 trace ID；账单唯一键另用内部 reservation ID。
 
 **统一账户认证体系（控制台后端，第 14 步）**：⑭ 把管理面从裸 token 升级为「账号密码 + 会话」。`SessionData` 承载 CSRF token 与 session version；受保护路由用 `SessionAuthWithVersion`，写请求过 `CSRFProtect`。登录/注册在 bcrypt 前执行来源 IP 与账户标识预算，`TryAcquire` 满载立即 503；Redis 原子限制每账户活跃会话。自助 Key 由存储层原子限制 50 把，另有账户总桶与单 Key 上限。
+
+**控制台前端（第 16 步）**：⑯ Vite 5 + React 18 + TS + `@douyinfe/semi-ui`，源码在 `web/`。`vite build` 产物输出 `internal/server/web_dist`，`console.go` `//go:embed all:web_dist` 打进二进制，`/console/*` 伺服 + SPA fallback（仅 `admin.enabled=true` 挂载）。`api/client.ts` 从 Cookie 读 CSRF token 注入 `X-CSRF-Token` 对齐 `CSRFProtect`；dev vite proxy 用字符串简写（`changeOrigin:false`）保持同源。**改前端后必须 `npm run build` 重新生成 `web_dist` 才会被 embed**。
 
 **审查修复进度（2026-07-11）**：路由许可代际、HTTP/SSE 超时与大小限制、协议联合字段/工具参数/n=1 显式拒绝、控制台滥用防护、SSRF、Redis TLS、渠道密钥加密、版本化迁移、指标防护和依赖公告均已落地。P1-12 仍部分修复；P2-03 仅剩 OpenAI→Anthropic 迟到 input usage 无法在线格式表达，账本按预授权保守结算。真实 PostgreSQL 迁移/故障注入与真实 Redis TLS 集成仍待上线验收。
 

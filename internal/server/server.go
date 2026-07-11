@@ -152,6 +152,7 @@ func (s *Server) registerRoutes() {
 	s.registerAuthRoutes()
 	s.registerMeRoutes()
 	s.registerAdminRoutes()
+	s.registerConsole()
 }
 
 func newMetricsHandler(cfg config.ServerConfig, gatherer prometheus.Gatherer) http.Handler {

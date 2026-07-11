@@ -1,0 +1,24 @@
+/* 全局基础样式。Mantine 组件样式走各自的 styles.css，这里只放布局级补充。 */
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* 页面内容内边距容器：admin/portal 各页正文统一留白。 */
+.page-container {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* 登录/注册等居中卡片场景的全屏容器。 */
+.centered-screen {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  padding: 16px;
+}
